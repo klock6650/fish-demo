@@ -1,0 +1,4922 @@
+-- ============================================================================
+-- 海上钓鱼 - 2D 俯视角拖钓游戏
+-- 玩法: 开船在海面上行驶, 拖钓触发鱼咬钩, 力度条遛鱼
+-- 渲染: 纯 NanoVG 矢量绘制 + 2D 水面 shader 效果
+-- ============================================================================
+
+require "LuaScripts/Utilities/Sample"
+local PlayerData = require "PlayerData"
+local Inventory = require "Inventory"
+local IslandMenu = require "IslandMenu"
+local MapSampler = require "MapSampler"
+local IslandSystem = require "IslandSystem"
+
+-- ============================================================================
+-- NanoVG 上下文
+-- ============================================================================
+local vg = nil
+local fontId = -1
+
+-- ============================================================================
+-- 游戏配置
+-- ============================================================================
+local CFG = {
+    -- 小船
+    BOAT_MAX_SPEED   = 130,
+    BOAT_ACCEL       = 90,
+    BOAT_DECEL       = 30,
+    BOAT_TURN_SPEED  = 0.7,
+    BOAT_LENGTH      = 42,
+    BOAT_WIDTH       = 21,
+
+    -- 拖钓
+    LINE_LENGTH      = 250,
+    ROPE_SEGMENTS    = 36,       -- 绳索节点数
+    BITE_AVG_TIME    = 30.0,  -- 咬钩平均时间(秒)
+    BITE_MIN_PCT     = 0.10,  -- 最小倍率: 平均值的10%
+    BITE_MAX_PCT     = 3.00,  -- 最大倍率: 平均值的300%
+    BITE_WINDOW      = 2.5,   -- 咬钩后反应时间
+    ROD_COUNT        = 2,     -- 鱼竿数量
+
+    -- 遛鱼系统 (基于 Godot 参考实现的弹性张力 + 极坐标鱼AI)
+    FIGHT_LINE_MAX     = 750,    -- 最大线容量(米), 超过=清杯
+    FIGHT_LINE_STRENGTH = 100,   -- 鱼线强度(kg), 张力超过此值=断线
+    FIGHT_CATCH_DIST   = 40,     -- 鱼距 <= 此值 = 成功(米)
+    FIGHT_STRETCH_MAX  = 25.0,   -- 最大弹性拉伸距离(米), 超过此距离张力=MAX
+
+    -- 刹车 (档位制: 0~29 对应 0%~40%, 30档=锁死)
+    FIGHT_DRAG_GEARS     = 30,   -- 总档数(不含锁死档)
+    FIGHT_DRAG_MAX_RATIO = 0.40, -- 最高档(29)对应的张力比例
+    FIGHT_DRAG_DEFAULT_GEAR = 15,-- 默认起始档位
+    -- (静/动摩擦力已被约束解算替代, 不再需要)
+
+    -- 卷轮 (收线 + 放线惯性)
+    FIGHT_REEL_ACCEL   = 20.0,   -- 收线加速度(米/秒²)
+    FIGHT_REEL_MAX     = 35.0,   -- 最大收线速度(米/秒)
+    FIGHT_SLIP_MASS      = 0.0004, -- 卷轮虚拟质量(kg), 越大惯性越大加速越慢
+    FIGHT_SLIP_DAMPING   = 0.01,  -- 粘性阻尼系数, 越大抖动越小但惯性感越弱
+    FIGHT_SLIP_SPEED_MAX = 120,  -- 放线速度安全上限(米/秒)
+
+    -- 打滑 (惯性模型)
+    -- (打滑加速度/质量/最小持续已被约束解算替代, 不再需要)
+
+    -- 视觉平滑
+    FIGHT_SLIP_MEMORY  = 1.0,    -- 打滑记忆持续时间(秒, 仅用于显示)
+
+    -- 鱼AI物理
+    FISH_MASS          = 0.1,    -- 鱼的质量
+    FISH_DRAG_COEFF    = 1.0,    -- 水阻力系数
+    FISH_SPEED_CAP     = 40,     -- 径向最大速度
+    FISH_TAN_SPEED_CAP = 60,     -- 切向最大速度
+    FISH_MAX_ANGLE     = 60,     -- 最大偏转角度(度)
+    FISH_ANGLE_DAMP_START = 30,  -- 开始阻尼的角度(度)
+    FISH_RESTORE_STR   = 2.0,    -- 角度恢复力强度
+
+    -- 虚拟摇杆
+    JOYSTICK_R       = 50,
+    JOYSTICK_INNER   = 18,
+    ACTION_BTN_R     = 36,
+
+    -- 抛竿蓄力
+    CAST_CHARGE_TIME  = 1.5,    -- 满蓄力时间(秒)
+    CAST_MIN_DIST     = 60,     -- 最小抛投距离(米)
+    CAST_MAX_DIST     = 300,    -- 最大抛投距离(米)
+    CAST_FLY_SPEED    = 600,    -- 鱼线飞行速度(米/秒)
+    CAST_ARC_HEIGHT   = 50,     -- 抛物线高度(像素, 仅视觉)
+
+    -- 抬杆 (提竿)
+    STRIKE_DURATION   = 0.35,   -- 抬杆动画总时长(秒)
+    STRIKE_LIFT_PX    = 12,     -- 鱼竿抬起最大高度(像素, sprite stack 偏移)
+    STRIKE_SHAKE_AMP  = 3,      -- 鱼线抖动振幅(像素)
+    STRIKE_ZOOM_PUNCH = 0.08,   -- 镜头缩放脉冲增量
+
+    -- 抬杆 (fight 状态下右键压杆)
+    FIGHT_LIFT_MAX_ANGLE = math.rad(55), -- 最大抬起角度(弧度), 55° ≈ 0.96 rad
+    FIGHT_LIFT_SPEED_UP  = 1.4,          -- 抬杆基础速度 (慢抬, 1/秒)
+    FIGHT_LIFT_SPEED_DOWN = 5.0,         -- 放杆基础速度 (快放, 1/秒)
+    FIGHT_LIFT_TENSION_DRAG = 0.7,       -- 张力对抬杆的阻力系数 (0=无阻力, 1=满张力时速度归零)
+    FIGHT_LIFT_PX        = 10,           -- 竿尖最大抬起像素偏移 (sprite stack 叠加)
+
+    -- sprite stacking
+    STACK_OFFSET         = 2.25,        -- 层间垂直偏移 (像素)
+    ROD_STACK_LAYER      = 6.5,         -- 鱼竿所在 sprite-stack 层
+}
+
+-- ============================================================================
+-- 鱼种数据
+-- ============================================================================
+local FISH_TYPES = {
+    --                                                         体力   最大拉力(决定径向逃跑力)
+    { name = "鲈鱼",   diff = 1, color = {120,180,80},  wMin = 0.5,  wMax = 2.5,
+      stamina = 40,  maxForce = 35,  calmProb = 0.75 },
+    { name = "鲷鱼",   diff = 2, color = {230,110,90},  wMin = 1.0,  wMax = 4.0,
+      stamina = 55,  maxForce = 50,  calmProb = 0.70 },
+    { name = "金枪鱼", diff = 3, color = {80,130,210},  wMin = 3.0,  wMax = 10.0,
+      stamina = 75,  maxForce = 70,  calmProb = 0.60 },
+    { name = "旗鱼",   diff = 4, color = {100,80,200},  wMin = 5.0,  wMax = 18.0,
+      stamina = 90,  maxForce = 85,  calmProb = 0.55 },
+    { name = "鲨鱼",   diff = 5, color = {110,115,125}, wMin = 10.0, wMax = 50.0,
+      stamina = 100, maxForce = 100, calmProb = 0.50 },
+    { name = "测试鱼", diff = 3, color = {255,50,50},  wMin = 5.0,  wMax = 5.0,
+      stamina = 9999, maxForce = 70, calmProb = 0.0, testFixed = true },
+}
+
+-- ============================================================================
+-- 音效
+-- ============================================================================
+---@type Scene
+local audioScene = nil
+---@type Node
+local audioNode = nil
+---@type SoundSource
+local sfxSlip = nil       -- 出线音效播放源
+---@type SoundSource
+local sfxReel = nil       -- 收线音效播放源
+---@type Sound
+local sndSlip = nil       -- 出线音效资源
+---@type Sound
+local sndReel = nil       -- 收线音效资源
+
+-- ============================================================================
+-- 游戏状态
+-- ============================================================================
+local STATE = "menu"     -- menu / sailing / trolling / bite / fight / catch / fail
+local gameTime = 0
+local screenW, screenH = 0, 0
+
+-- 小船
+local boat = {
+    x = 0, y = 0,           -- 世界坐标
+    angle = 0,               -- 朝向弧度 (0=上)
+    speed = 0,
+    cruise = false,          -- 巡航模式(持续行驶)
+}
+
+-- 相机 (跟随小船, 世界坐标偏移 + 缩放)
+local camX, camY = 0, 0
+local camScale = 1.0         -- 当前缩放 (1.0=正常, >1=放大/鱼看起来更快)
+local camScaleTarget = 1.0   -- 目标缩放 (平滑过渡)
+
+-- 尾流粒子
+local wakeParticles = {}
+
+-- 海浪精灵粒子
+local waveSprites = {}
+local waveImages = {}       -- nvgCreateImage handles
+local WAVE_MAX = 18         -- 同时最大海浪数
+local WAVE_SPAWN_CD = 0.8   -- 生成间隔(秒)
+local waveSpawnTimer = 0
+local WAVE_CURRENT_ANGLE = math.pi * 0.5  -- 向下
+
+-- 双鱼竿系统
+-- 每根鱼竿独立状态: "idle" / "trolling" / "bite"
+local rods = {
+    [1] = { state = "idle", timer = 0, biteAt = 0, biteTimer = 0, side = -1, rope = {}, aimAngle = 0 },  -- 左舷
+    [2] = { state = "idle", timer = 0, biteAt = 0, biteTimer = 0, side =  1, rope = {}, aimAngle = 0 },  -- 右舷
+}
+local activeRod = 1     -- 当前选中的鱼竿 (1 或 2)
+
+-- 鱼竿弯曲后竿尖世界坐标缓存 (每帧由 DrawBoat 更新)
+local rodBentTips = {}
+
+-- 抛竿蓄力状态
+local castState = {
+    charging = false,   -- 正在蓄力
+    power    = 0,       -- 蓄力值 0~1
+}
+
+-- 抬杆动画状态
+local strikeState = {
+    active   = false,   -- 正在播放抬杆动画
+    timer    = 0,       -- 动画计时器
+    rodIndex = 0,       -- 哪根竿在抬
+    fish     = nil,     -- 缓存待进入遛鱼的鱼
+    splashX  = 0,       -- 水花世界坐标
+    splashY  = 0,
+}
+
+-- 开发者鱼种选择菜单
+local devFishSelect = false
+local inventoryOpen = false
+local islandMenuOpen = false   -- false 或当前停靠的岛屿 landmark 引用
+local dockedIsland = nil       -- 停靠中的岛屿对象
+local mapOpen = false          -- 航海图是否打开
+
+-- 诊断记录器
+local diagEnabled = false       -- 是否正在记录
+local diagLog = {}              -- { {t, tension, slipSpeed, lineLen, drag}, ... }
+local diagStartTime = 0         -- 记录起始时间
+local diagInfiniteLine = false  -- 无限线长模式
+local diagFileCount = 0         -- 导出文件计数器
+
+-- 实时波形图
+local diagChartOn = false        -- 波形图开关
+local DIAG_CHART_LEN = 480      -- 缓冲帧数 (~8秒@60fps)
+local diagChartBuf = {}          -- 滚动缓冲 { tension, dragF }
+local diagChartIdx = 0           -- 写入位置 (0-based 循环)
+
+-- 遛鱼面板折叠 (Tab 切换)
+local fightDetailOpen = false
+
+-- 鱼影
+local fishShadows = {}
+local floatingPlanks = {}       -- 海面漂浮木板 {x, y, angle, drift, wobbleT, woodAmount}
+local PLANK_PICKUP_DIST = 40    -- 拾取距离(米)
+local PLANK_COUNT = 8           -- 初始木板数量
+local PLANK_RESPAWN_DIST = 600  -- 离船太远时回收重生
+local ISLAND_DOCK_DIST = 120   -- 岛屿停靠交互半径
+
+-- ── 海域分区系统 ─────────────────────────────────────────────────────────
+-- R 通道值 → { 颜色1(亮), 颜色2(暗), 代号 }
+local ZONE_TABLE = {
+    [0]   = { {23,74,119},  {18,60,100},  "区域-00" },
+    [30]  = { {29,78,121},  {24,64,102},  "区域-30" },
+    [50]  = { {40,150,172}, {32,126,148}, "区域-50" },
+    [70]  = { {40,141,172}, {32,118,148}, "区域-70" },
+    [90]  = { {45,95,117},  {36,78,100},  "区域-90" },
+    [110] = { {45,90,117},  {36,74,100},  "区域-110" },
+    [130] = { {73,122,175}, {58,102,148}, "区域-130" },
+    [150] = { {77,114,179}, {62,96,152},  "区域-150" },
+    [170] = { {89,125,187}, {72,105,160}, "区域-170" },
+    [190] = { {57,125,164}, {45,110,150}, "区域-190" },  -- 默认/当前
+    [210] = { {29,88,149},  {24,72,126},  "区域-210" },
+}
+local currentZoneR = 190          -- 当前区域 R 值
+local targetZoneR  = 190          -- 目标区域 R 值
+local zoneColorT   = 1.0          -- 颜色过渡进度 0→1
+local ZONE_FADE_SPEED = 1.5       -- 过渡速度（秒⁻¹）
+local zoneNotify = { text = "", timer = 0, alpha = 0 }  -- 区域切换通知
+local pendingZoneR = 190          -- 候选区域 R 值（去抖用）
+local pendingZoneTime = 0         -- 候选区域驻留时间
+local ZONE_DEBOUNCE = 1.0         -- 需持续驻留 1 秒才确认切换
+
+-- 遛鱼系统 (极坐标鱼AI + 弹性张力)
+local fight = {
+    -- 线与张力
+    lineLength   = 0,          -- 当前鱼线长度(米) = 卷轮上放出的线
+    tension      = 0,          -- 实际张力(kg)
+    tensionVisual = 0,         -- 显示用张力(kg)
+    dragGear     = 15,         -- 刹车档位 0~30 (30=锁死)
+    drag         = 0,          -- 刹车比例 (由 dragGear 派生)
+
+    -- 鱼极坐标 (相对于竿尖)
+    fishRadius   = 0,          -- 鱼到竿尖的距离(米)
+    fishAngle    = 0,          -- 鱼的角度(弧度, 相对初始方向)
+    fishInitAngle = 0,         -- 咬钩时的初始角度(弧度)
+    fishRadVel   = 0,          -- 径向速度(米/秒, 正=远离)
+    fishAngVel   = 0,          -- 角速度(弧度/秒)
+
+    -- 径向波动
+    radWaveTime  = 0,          -- 当前波形已持续时间
+    radWaveDur   = 1,          -- 当前波形总周期
+    radWaveBase  = 0,          -- 波形基础值 (0-1)
+
+    -- 径向振幅状态 (calm/active 双状态机)
+    radState     = "calm",     -- "calm" / "active"
+    radStateTimer = 0,         -- 当前状态已持续时间
+    radStateDur  = 0,          -- 当前状态目标时长
+    radAmpPctTarget = 0,       -- 目标振幅 (基线的百分比)
+    radAmpPct    = 0,          -- 当前振幅百分比 (平滑过渡)
+
+    -- 切向波动
+    tanWaveTime  = 0,
+    tanWaveDur   = 1,
+    tanWaveAmp   = 0,
+    tanWaveBase  = 0,
+    tanState     = "calm",     -- "calm" / "active"
+    tanTimer     = 0,          -- 当前切向状态持续时间
+    tanDuration  = 0,          -- 当前切向状态目标时长
+
+    -- 挣扎微力 (tremor + jerk)
+    tremorPhase  = 0,          -- 颤动相位(弧度, 持续累加)
+    tremorPhase2 = 0,          -- 第二谐波相位(更自然)
+    jerkTimer    = 0,          -- 甩头剩余时间
+    jerkDurTotal = 0,          -- 甩头总时长(用于包络计算)
+    jerkCooldown = 0,          -- 甩头冷却计时
+    jerkAmp      = 0,          -- 当前甩头振幅系数
+
+    -- 打滑 (卷轮惯性模型)
+    slipping     = false,      -- 本帧是否发生放线
+    slipSpeed    = 0,          -- 当前放线速度(米/秒, >=0)
+
+    -- 收线
+    reeling      = false,      -- 玩家是否按住收线键
+    reelSpeed    = 0,          -- 当前收线速度(加速度模型)
+    effectiveReel = 0,         -- 有效收线速度(受张力衰减, 供UI显示)
+    reelAngle    = 0,          -- 卷轮图标累积旋转角度(弧度)
+
+    -- 视觉平滑
+    slipRecentTimer = 0,       -- 最近打滑记忆计时器
+
+    -- 断线延迟
+    breakTimer   = 0,          -- 断线倒计时(秒)
+    breakDelay   = 0,          -- 断线延迟时长(随机 0.2~0.7秒)
+
+    -- 鱼体力
+    fishStamina  = 100,
+    fishMaxStam  = 100,
+
+    -- 元数据
+    fightTime    = 0,
+    resultTimer  = 0,
+}
+
+-- 当前钓到的鱼
+local curFish = nil
+
+-- 收获
+local caughtList = {}
+local totalWeight = 0.0
+
+-- 浮标 / 岛屿 (世界坐标)
+local landmarks = {}
+
+-- 水面时间
+local waterTime = 0
+
+-- 通知
+local notify = { text = "", timer = 0, color = {255,255,255,255} }
+
+-- 虚拟摇杆
+local vJoy = {
+    active = false,
+    baseX = 0, baseY = 0,
+    stickX = 0, stickY = 0,
+    dx = 0, dy = 0,
+}
+
+-- 动作按钮
+local actionJustPressed = false
+local actionDown = false
+local prevActionDown = false
+
+-- ============================================================================
+-- 生命周期
+-- ============================================================================
+
+function Start()
+    SampleStart()
+    graphics.windowTitle = "海上钓鱼"
+
+    vg = nvgCreate(1)
+    if not vg then
+        print("ERROR: nvgCreate failed")
+        return
+    end
+    fontId = nvgCreateFont(vg, "sans", "Fonts/MiSans-Regular.ttf")
+
+    -- 海浪帧动画贴图 (8帧)
+    waveImages = {}
+    for i = 0, 7 do
+        local id = nvgCreateImage(vg, "image/wave_frame_" .. i .. ".png", 0)
+        if id == 0 then print("[WARN] wave frame not loaded: #" .. i) end
+        table.insert(waveImages, id)
+    end
+
+    -- (旧岛屿/装饰贴图已移除，由 IslandSystem 统一管理)
+
+    SampleInitMouseMode(MM_FREE)
+
+    -- 音效初始化
+    audioScene = Scene()
+    audioNode = audioScene:CreateChild("SFX")
+    sfxSlip = audioNode:CreateComponent("SoundSource")
+    sfxSlip.soundType = "Effect"
+    sndSlip = cache:GetResource("Sound", "audio/sfx/reel_slip.ogg")
+    sndSlip.looped = true
+
+    sfxReel = audioNode:CreateComponent("SoundSource")
+    sfxReel.soundType = "Effect"
+    sndReel = cache:GetResource("Sound", "audio/sfx/reel_wind.ogg")
+    sndReel.looped = true
+
+    -- 初始化地标
+    -- 注册地图采样图层（图片中心 = 船出生点 (0,0)）
+    -- 1200px × 20 = 24000 世界单位覆盖，Lua 数据绕过纹理压缩管线
+    MapSampler.Register("fish_density", "fish_density_data", 0, 0, 20)
+    MapSampler.Register("zone", "zone_partition_data", 0, 0, 20)
+
+    IslandSystem.Init(vg)
+    InitLandmarks()
+    InitWaveSprites()
+    InitFishShadows()
+    InitFloatingPlanks()
+
+    SubscribeToEvent(vg, "NanoVGRender", "HandleRender")
+    SubscribeToEvent("Update", "HandleUpdate")
+    SubscribeToEvent("KeyDown", "HandleKeyDown")
+
+    -- 初始数值（测试用，后续由存档系统替代）
+    PlayerData.AddMoney(150)
+    PlayerData.AddResource("wood", 30)
+
+    print("=== 海上钓鱼 ===")
+end
+
+function Stop()
+    if vg then nvgDelete(vg) end
+end
+
+-- ============================================================================
+-- 初始化
+-- ============================================================================
+
+function InitLandmarks()
+    landmarks = {}
+    islandDecos = {}
+
+    -- ════════════════════════════════════════════════════════════════════════
+    -- 从 IslandSystem 填充 landmarks 表（保持与 IslandMenu / 停靠系统兼容）
+    -- 岛屿图层渲染由 IslandSystem 独立处理，landmarks 仅提供功能数据
+    -- ════════════════════════════════════════════════════════════════════════
+    for id, island in pairs(IslandSystem.GetIslands()) do
+        local lm = {
+            kind     = "island",
+            id       = island.id,
+            name     = "岛屿 " .. island.id,
+            x        = island.x,
+            y        = island.y,
+            drawW    = island.w * 2,   -- TEXTURE_SCALE = 2
+            drawH    = island.h * 2,
+            angle    = 0,
+            features = { "sell_fish", "refuel" },
+        }
+        table.insert(landmarks, lm)
+    end
+
+    print("[Landmarks] Loaded " .. #landmarks .. " islands (via IslandSystem)")
+end
+
+-- ============================================================================
+-- 海浪精灵系统 (手绘风浪花漂浮在海面上)
+-- ============================================================================
+
+function InitWaveSprites()
+    waveSprites = {}
+    -- 预生成一批初始海浪, 散布在相机周围
+    for _ = 1, WAVE_MAX do
+        SpawnWaveSprite(true)
+    end
+end
+
+function SpawnWaveSprite(randomAge)
+    if #waveImages == 0 then return end
+    -- 原图比例 155:61 ≈ 2.54:1, 缩小3倍
+    local baseW = 167
+    local baseH = 66
+    local scaleMul = 0.8 + math.random() * 0.6  -- 0.8~1.4
+
+    -- 帧动画: 淡入 → 播放一个周期 → 淡出
+    local frameCount = #waveImages
+    local animSpeed = 4 + math.random() * 3  -- 4~7 fps (慢一点更自然)
+    local cycleDur = frameCount / animSpeed
+    local fi = 0.5   -- 淡入时长
+    local fo = 1.0   -- 淡出时长
+    local maxLife = fi + cycleDur + fo
+    local age = randomAge and (math.random() * maxLife) or 0
+
+    -- 生成在相机可见区域附近
+    local spawnRange = 900
+    local wx = camX + (math.random() - 0.5) * spawnRange * 2
+    local wy = camY + (math.random() - 0.5) * spawnRange * 2
+
+    -- 统一洋流方向, 统一朝向
+    local driftAngle = WAVE_CURRENT_ANGLE
+    local driftSpeed = 7.5 + math.random() * 9
+
+    -- 所有海浪朝向一致
+    local facing = 0
+
+    table.insert(waveSprites, {
+        x = wx, y = wy,
+        w = baseW * scaleMul,
+        h = baseH * scaleMul,
+        angle = facing,
+        dx = math.cos(driftAngle) * driftSpeed,
+        dy = math.sin(driftAngle) * driftSpeed,
+        life = maxLife,
+        age = age,
+        fadeIn = fi,
+        fadeOut = fo,
+        frameTimer = math.random() * frameCount / animSpeed,  -- 随机起始相位
+        animSpeed = animSpeed,
+    })
+end
+
+function UpdateWaveSprites(dt)
+    -- 更新现有海浪
+    for i = #waveSprites, 1, -1 do
+        local w = waveSprites[i]
+        w.age = w.age + dt
+        if w.age >= w.life then
+            table.remove(waveSprites, i)
+        else
+            -- 漂移
+            w.x = w.x + w.dx * dt
+            w.y = w.y + w.dy * dt
+            -- 帧动画推进
+            w.frameTimer = w.frameTimer + dt
+        end
+    end
+
+    -- 补充新海浪
+    waveSpawnTimer = waveSpawnTimer + dt
+    if waveSpawnTimer >= WAVE_SPAWN_CD and #waveSprites < WAVE_MAX then
+        waveSpawnTimer = 0
+        SpawnWaveSprite(false)
+    end
+end
+
+function DrawWaveSprites()
+    local frameCount = #waveImages
+    if frameCount == 0 then return end
+
+    for _, w in ipairs(waveSprites) do
+        local sx, sy = WorldToScreen(w.x, w.y)
+        local margin = math.max(w.w, w.h)
+        if sx > -margin and sx < screenW + margin and sy > -margin and sy < screenH + margin then
+            -- 淡入淡出 alpha
+            local alpha = 1.0
+            if w.age < w.fadeIn then
+                alpha = w.age / w.fadeIn
+            elseif w.age > w.life - w.fadeOut then
+                alpha = (w.life - w.age) / w.fadeOut
+            end
+            alpha = math.max(0, math.min(1, alpha)) * 0.7
+
+            -- 帧动画: 播放一个周期后停在最后一帧
+            local rawFrame = math.floor(w.frameTimer * w.animSpeed)
+            local frameIdx = math.min(rawFrame, frameCount - 1) + 1
+            local imgId = waveImages[frameIdx]
+            if imgId and imgId > 0 then
+                nvgSave(vg)
+                nvgTranslate(vg, sx, sy)
+                nvgRotate(vg, w.angle)
+                nvgGlobalAlpha(vg, alpha)
+
+                local pat = nvgImagePattern(vg, -w.w/2, -w.h/2, w.w, w.h, 0, imgId, 1.0)
+                nvgBeginPath(vg)
+                nvgRect(vg, -w.w/2, -w.h/2, w.w, w.h)
+                nvgFillPaint(vg, pat)
+                nvgFill(vg)
+
+                nvgRestore(vg)
+            end
+        end
+    end
+end
+
+function InitFishShadows()
+    fishShadows = {}
+    for i = 1, 12 do
+        table.insert(fishShadows, {
+            x = boat.x + math.random(-400, 400),
+            y = boat.y + math.random(-400, 400),
+            angle = math.random() * math.pi * 2,
+            speed = 20 + math.random(30),
+            size = 8 + math.random(12),
+            wobble = math.random() * 10,
+            attracted = false,
+        })
+    end
+end
+
+-- ── 漂浮木板 ────────────────────────────────────────────────────────────────
+
+--- 在船周围随机位置生成一块木板
+local function SpawnPlank(near)
+    local ang = math.random() * math.pi * 2
+    local dist = 150 + math.random(300)
+    return {
+        x = near.x + math.cos(ang) * dist,
+        y = near.y + math.sin(ang) * dist,
+        angle = math.random() * math.pi * 2,
+        drift = 0.3 + math.random() * 0.5,     -- 漂流速度
+        driftAngle = math.random() * math.pi * 2,
+        wobbleT = math.random() * 10,
+        woodAmount = 2 + math.random(4),         -- 拾取获得 2~6 木料
+        length = 16 + math.random(10),            -- 木板长度 16~26
+        width = 4 + math.random(3),               -- 木板宽度 4~7
+    }
+end
+
+function InitFloatingPlanks()
+    floatingPlanks = {}
+    for i = 1, PLANK_COUNT do
+        table.insert(floatingPlanks, SpawnPlank(boat))
+    end
+end
+
+function UpdateFloatingPlanks(dt)
+    for _, p in ipairs(floatingPlanks) do
+        -- 缓慢漂流 + 轻微晃动
+        p.wobbleT = p.wobbleT + dt
+        p.angle = p.angle + math.sin(p.wobbleT * 0.7) * 0.15 * dt
+        p.driftAngle = p.driftAngle + (math.random() - 0.5) * 0.3 * dt
+        p.x = p.x + math.cos(p.driftAngle) * p.drift * dt
+        p.y = p.y + math.sin(p.driftAngle) * p.drift * dt
+
+        -- 离船太远则重新在船附近生成
+        local dx = p.x - boat.x
+        local dy = p.y - boat.y
+        if math.sqrt(dx * dx + dy * dy) > PLANK_RESPAWN_DIST then
+            local newP = SpawnPlank(boat)
+            p.x, p.y = newP.x, newP.y
+            p.angle = newP.angle
+            p.driftAngle = newP.driftAngle
+            p.wobbleT = newP.wobbleT
+            p.woodAmount = newP.woodAmount
+            p.length = newP.length
+            p.width = newP.width
+        end
+    end
+end
+
+--- 寻找最近的可拾取木板，返回 index 或 nil
+function FindNearestPlank()
+    local bestIdx, bestDist = nil, PLANK_PICKUP_DIST
+    for i, p in ipairs(floatingPlanks) do
+        local dx = p.x - boat.x
+        local dy = p.y - boat.y
+        local dist = math.sqrt(dx * dx + dy * dy)
+        if dist < bestDist then
+            bestDist = dist
+            bestIdx = i
+        end
+    end
+    return bestIdx
+end
+
+function FindNearestIsland()
+    -- 委托给 IslandSystem 查找最近岛屿
+    local island, dist = IslandSystem.FindNearest(boat.x, boat.y, ISLAND_DOCK_DIST)
+    if not island then return nil end
+    -- 映射回 landmarks 条目（IslandMenu 等依赖 landmark 字段）
+    for _, lm in ipairs(landmarks) do
+        if lm.id == island.id then return lm end
+    end
+    return nil
+end
+
+function ShowNotify(text, r, g, b)
+    notify.text = text
+    notify.timer = 2.5
+    notify.color = {r or 255, g or 255, b or 255, 255}
+end
+
+--- 生成随机咬钩时间: 平均值的 10%~300%，受鱼群密度系数影响
+--- 密度系数越高(白区) → 等待时间越短 → 上鱼越快
+function RandomBiteTime()
+    local avg = CFG.BITE_AVG_TIME
+    local minT = avg * CFG.BITE_MIN_PCT
+    local maxT = avg * CFG.BITE_MAX_PCT
+    local baseTime = minT + math.random() * (maxT - minT)
+
+    -- 鱼群密度系数：系数越大 → 除以后时间越短
+    local densityCoeff = MapSampler.GetFishDensity(boat.x, boat.y)
+    return baseTime / math.max(0.1, densityCoeff)
+end
+
+--- 获取任一鱼竿是否处于拖钓或咬钩状态
+function AnyRodActive()
+    for i = 1, CFG.ROD_COUNT do
+        if rods[i].state ~= "idle" then return true end
+    end
+    return false
+end
+
+-- ============================================================================
+-- 绳索物理 (Verlet 积分)
+-- ============================================================================
+
+--- 获取鱼竿在船尾的锚点世界坐标
+--- 鱼竿座在船体上的位置 (甲板层，竿根)
+function GetRodBaseLocal()
+    local L = CFG.BOAT_LENGTH
+    local W = CFG.BOAT_WIDTH
+    -- 竿根在船尾两侧: 纵向0.4L (船尾方向), 横向0.35W
+    return W * 0.35, L * 0.4
+end
+
+--- 鱼竿尖端在船体上的位置 (竿尖，鱼线起点)
+--- 竿尖 = 竿根 + 5倍 (原始竿根→竿尖方向向量)
+function GetRodTipLocal()
+    local L = CFG.BOAT_LENGTH
+    local W = CFG.BOAT_WIDTH
+    -- 竿根: (0.35W, 0.4L),  原始竿尖: (0.85W, 0.55L)
+    -- 方向向量: (0.5W, 0.15L), ×5 → (2.5W, 0.75L)
+    -- 新竿尖: (0.35W + 2.5W, 0.4L + 0.75L) = (2.85W, 1.15L)
+    return W * 2.85, L * 1.15
+end
+
+--- 获取鱼竿物理长度 (竿根到竿尖的直线距离, 世界单位)
+function GetRodPhysicalLength()
+    local bx, by = GetRodBaseLocal()
+    local tx, ty = GetRodTipLocal()
+    local dx = tx - bx
+    local dy = ty - by
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+--- 获取鱼竿尖端的世界坐标 (鱼线锚点)
+--- 优先返回弯曲后的竿尖位置 (由 DrawBoat 每帧缓存)
+function GetRodAnchor(rodIndex)
+    -- 始终返回直线竿尖位置 (物理锚点, 不受弯曲影响)
+    -- 弯曲仅影响视觉, 由 rodBentTips 在 DrawFishingLine 中使用
+    local rod = rods[rodIndex]
+    local tipX, tipY = GetRodTipLocal()
+    tipX = tipX * rod.side  -- 左舷/右舷镜像
+
+    local cosA = math.cos(boat.angle)
+    local sinA = math.sin(boat.angle)
+    local wx = boat.x + tipX * cosA - tipY * sinA
+    local wy = boat.y + tipX * sinA + tipY * cosA
+    return wx, wy
+end
+
+--- 获取鱼竿旋转后竿尖的世界坐标 (唯一真值源)
+--- 将竿尖绕竿根旋转 rod.aimAngle, 再应用抬杆压缩, 最后转为世界坐标
+function GetRotatedTipWorld(rodIndex)
+    local rod = rods[rodIndex]
+    local bx, by = GetRodBaseLocal()
+    local tx, ty = GetRodTipLocal()
+    bx = bx * rod.side
+    tx = tx * rod.side
+    -- 竿根→竿尖 方向向量 (本地坐标)
+    local dx = tx - bx
+    local dy = ty - by
+    -- 绕竿根旋转 aimAngle
+    local cosR = math.cos(rod.aimAngle)
+    local sinR = math.sin(rod.aimAngle)
+    local rx = dx * cosR - dy * sinR
+    local ry = dx * sinR + dy * cosR
+    -- 抬杆伪透视压缩: 竿身绕竿根向上旋转, 水平投影 = cos(liftAngle)
+    if STATE == "fight" and rodIndex == activeRod and (fight.liftT or 0) > 0.001 then
+        local liftAngle = fight.liftT * CFG.FIGHT_LIFT_MAX_ANGLE
+        local cosLift = math.cos(liftAngle)
+        rx = rx * cosLift
+        ry = ry * cosLift
+    end
+    -- 旋转后的竿尖本地坐标
+    local rtx = bx + rx
+    local rty = by + ry
+    -- 本地→世界
+    local cosA = math.cos(boat.angle)
+    local sinA = math.sin(boat.angle)
+    local wx = boat.x + rtx * cosA - rty * sinA
+    local wy = boat.y + rtx * sinA + rty * cosA
+    return wx, wy
+end
+
+--- 统一计算所有鱼竿的朝向角度 (每帧在 UpdateRopes 之前调用)
+--- rod.aimAngle: 相对于默认竿身方向的旋转增量 (弧度)
+function UpdateRodAim(dt)
+    for i = 1, CFG.ROD_COUNT do
+        local rod_i = rods[i]
+        local targetAngle = 0  -- 默认: 不旋转
+
+        -- 竿根→竿尖的默认方向角 (本地坐标)
+        local bx, by = GetRodBaseLocal()
+        local tx, ty = GetRodTipLocal()
+        bx = bx * rod_i.side
+        tx = tx * rod_i.side
+        local rodAngle = math.atan(ty - by, tx - bx)
+
+        if STATE == "fight" and activeRod == i then
+            -- fight: 跟随鱼的拉力方向 (70%)
+            local straightTipX, straightTipY = GetRodTipLocal()
+            straightTipX = straightTipX * rod_i.side
+            local cosB = math.cos(boat.angle)
+            local sinB = math.sin(boat.angle)
+            local tipWX = boat.x + straightTipX * cosB - straightTipY * sinB
+            local tipWY = boat.y + straightTipX * sinB + straightTipY * cosB
+            local fx, fy = GetFishWorldPos()
+            local dx, dy = fx - tipWX, fy - tipWY
+            local dlen = math.sqrt(dx * dx + dy * dy)
+            if dlen > 0.1 then
+                local wPullX, wPullY = dx / dlen, dy / dlen
+                local cosA = math.cos(-boat.angle)
+                local sinA = math.sin(-boat.angle)
+                local localPullX = wPullX * cosA - wPullY * sinA
+                local localPullY = wPullX * sinA + wPullY * cosA
+                local pullAngle = math.atan(localPullY, localPullX)
+                local delta = pullAngle - rodAngle
+                while delta >  math.pi do delta = delta - 2 * math.pi end
+                while delta < -math.pi do delta = delta + 2 * math.pi end
+                targetAngle = delta * 0.7
+            end
+        elseif castState.charging and STATE == "sailing" and activeRod == i then
+            -- 蓄力: 跟随鼠标瞄准方向 (100%)
+            local mx = input:GetMousePosition().x
+            local my = input:GetMousePosition().y
+            local mwx, mwy = ScreenToWorld(mx, my)
+            local cosB = math.cos(boat.angle)
+            local sinB = math.sin(boat.angle)
+            local straightTipX, straightTipY = GetRodTipLocal()
+            straightTipX = straightTipX * rod_i.side
+            local tipWX = boat.x + straightTipX * cosB - straightTipY * sinB
+            local tipWY = boat.y + straightTipX * sinB + straightTipY * cosB
+            local adx, ady = mwx - tipWX, mwy - tipWY
+            local adist = math.sqrt(adx * adx + ady * ady)
+            if adist > 1 then
+                local cosA = math.cos(-boat.angle)
+                local sinA = math.sin(-boat.angle)
+                local localAimX = adx / adist * cosA - ady / adist * sinA
+                local localAimY = adx / adist * sinA + ady / adist * cosA
+                local aimAngle = math.atan(localAimY, localAimX)
+                local delta = aimAngle - rodAngle
+                while delta >  math.pi do delta = delta - 2 * math.pi end
+                while delta < -math.pi do delta = delta + 2 * math.pi end
+                targetAngle = delta
+            end
+        elseif rod_i.state ~= "idle" and rod_i.rope and #rod_i.rope >= 2 then
+            -- trolling/bite/casting: 跟随鱼饵方向 (100%)
+            local lureNode = rod_i.rope[#rod_i.rope]
+            local cosB = math.cos(boat.angle)
+            local sinB = math.sin(boat.angle)
+            local straightTipX, straightTipY = GetRodTipLocal()
+            straightTipX = straightTipX * rod_i.side
+            local tipWX = boat.x + straightTipX * cosB - straightTipY * sinB
+            local tipWY = boat.y + straightTipX * sinB + straightTipY * cosB
+            local ldx, ldy = lureNode.x - tipWX, lureNode.y - tipWY
+            local ldist = math.sqrt(ldx * ldx + ldy * ldy)
+            if ldist > 1 then
+                local cosA = math.cos(-boat.angle)
+                local sinA = math.sin(-boat.angle)
+                local localLureX = ldx / ldist * cosA - ldy / ldist * sinA
+                local localLureY = ldx / ldist * sinA + ldy / ldist * cosA
+                local lureAngle = math.atan(localLureY, localLureX)
+                local delta = lureAngle - rodAngle
+                while delta >  math.pi do delta = delta - 2 * math.pi end
+                while delta < -math.pi do delta = delta + 2 * math.pi end
+                targetAngle = delta
+            end
+        end
+        -- else idle → targetAngle = 0
+
+        -- ── 拖钓状态角度限制 (仅拖钓, 其他状态自由) ──
+        local rotSpeed = 10.0
+        local isTrolling = rod_i.state == "trolling" or rod_i.state == "idle"
+        local isFighting = STATE == "fight" and activeRod == i
+        local isBiting = rod_i.state == "bite"
+        local isCasting = castState.charging and activeRod == i
+        if isTrolling and not isFighting and not isBiting and not isCasting then
+            local absTarget = rodAngle + targetAngle
+            while absTarget >  math.pi do absTarget = absTarget - 2 * math.pi end
+            while absTarget < -math.pi do absTarget = absTarget + 2 * math.pi end
+            local sideAlign = math.cos(absTarget) * rod_i.side
+            local threshold = 0.15
+            if sideAlign < threshold then
+                local clamped
+                if rod_i.side == 1 then
+                    -- 右舷: 有效区 [-limit, limit], 连续 clamp 无跳变
+                    local limit = math.acos(threshold)
+                    clamped = math.max(-limit, math.min(limit, absTarget))
+                else
+                    -- 左舷: 有效区 [limit, π] ∪ [-π, -limit], 按符号选边
+                    local limit = math.acos(-threshold)
+                    clamped = absTarget >= 0 and limit or -limit
+                end
+                targetAngle = clamped - rodAngle
+                while targetAngle >  math.pi do targetAngle = targetAngle - 2 * math.pi end
+                while targetAngle < -math.pi do targetAngle = targetAngle + 2 * math.pi end
+            end
+        end
+
+        -- 角度差归一化: 始终取最短旋转路径, 避免反向绕行
+        local angleDiff = targetAngle - rod_i.aimAngle
+        while angleDiff >  math.pi do angleDiff = angleDiff - 2 * math.pi end
+        while angleDiff < -math.pi do angleDiff = angleDiff + 2 * math.pi end
+
+        local lerpT = 1.0 - math.exp(-rotSpeed * dt)
+        rod_i.aimAngle = rod_i.aimAngle + angleDiff * lerpT
+
+        -- 归一化 aimAngle 防止无限增长
+        while rod_i.aimAngle >  math.pi do rod_i.aimAngle = rod_i.aimAngle - 2 * math.pi end
+        while rod_i.aimAngle < -math.pi do rod_i.aimAngle = rod_i.aimAngle + 2 * math.pi end
+    end
+end
+
+--- 获取鱼的世界坐标 (极坐标转直角坐标)
+function GetFishWorldPos()
+    local ax, ay = GetRotatedTipWorld(activeRod)
+    local totalAngle = fight.fishInitAngle + fight.fishAngle
+    local fx = ax + math.sin(totalAngle) * fight.fishRadius
+    local fy = ay - math.cos(totalAngle) * fight.fishRadius
+    return fx, fy
+end
+
+--- 初始化绳索节点链 (抛竿时调用)
+function InitRope(rodIndex)
+    local rod = rods[rodIndex]
+    local segments = CFG.ROPE_SEGMENTS
+    local segLen = CFG.LINE_LENGTH / segments
+
+    local ax, ay = GetRodAnchor(rodIndex)
+    -- 方向: 从竿尖向船尾后方延伸 (略微偏向外侧)
+    local outAngle = boat.angle + rod.side * 0.3
+    local dirX = math.sin(outAngle)
+    local dirY = -math.cos(outAngle)
+
+    rod.rope = {}
+    for i = 1, segments + 1 do
+        local t = (i - 1) / segments
+        local nx = ax + dirX * t * CFG.LINE_LENGTH
+        local ny = ay + dirY * t * CFG.LINE_LENGTH
+        rod.rope[i] = { x = nx, y = ny, px = nx, py = ny }
+    end
+end
+
+--- 更新所有活跃鱼竿的绳索
+function UpdateRopes(dt)
+    -- followSpeed: 节点跟随前一节点的速度，越大越紧，越小越拖沓
+    local followSpeed = 10.0
+    -- 帧率无关的平滑因子
+    local t = 1.0 - math.exp(-followSpeed * dt)
+
+    for ri = 1, CFG.ROD_COUNT do
+        local rod = rods[ri]
+        if rod.state ~= "idle" and #rod.rope > 0 then
+            local rope = rod.rope
+            local n = #rope
+
+            -- 1) 锚点 = 旋转后竿尖世界坐标 (由 UpdateRodAim 计算 aimAngle, 此处读取)
+            --    含 sprite-stack 高度偏移: 竿尖物理上在水面之上 (层 6.5 的真实高度)
+            local stackYOff = CFG.STACK_OFFSET * CFG.ROD_STACK_LAYER
+            local ax, ay = GetRotatedTipWorld(ri)
+            rope[1].x = ax
+            rope[1].y = ay - stackYOff
+
+            -- 2) 判断是否在 fight 状态 (且是当前活跃鱼竿)
+            local isFighting = (STATE == "fight" and ri == activeRod)
+
+            if isFighting then
+                -- ═══ fight 模式: 双端锚定 + 动态段长 ═══
+                -- 末端锚定到鱼的世界坐标
+                local fx, fy = GetFishWorldPos()
+                rope[n].x = fx
+                rope[n].y = fy
+
+                -- 段长 = 实际线长 / 段数 (随放线/收线动态变化)
+                local segLen = math.max(1, fight.lineLength / (n - 1))
+                local maxStretch = segLen * 1.15
+
+                -- PBD 双向解算: 迭代内用高刚度直接修正, 帧间用 t 控制柔软度
+                local iterations = 4
+                -- 帧间阻尼: 先将所有中间节点向"上一帧位置"混合, 产生柔软延迟感
+                for i = 2, n - 1 do
+                    local node = rope[i]
+                    local oldX, oldY = node.x, node.y
+                    -- t 越小线越柔软(跟随越慢), 越大越紧绷(即时响应)
+                    node.x = node.x + (node.x - (node.prevX or node.x)) * (1.0 - t)
+                    node.y = node.y + (node.y - (node.prevY or node.y)) * (1.0 - t)
+                    node.prevX, node.prevY = oldX, oldY
+                end
+
+                for iter = 1, iterations do
+                    -- 每次迭代重新锚定两端
+                    rope[1].x, rope[1].y = ax, ay - stackYOff
+                    rope[n].x, rope[n].y = fx, fy
+
+                    -- 正向: 从竿尖向鱼端 (直接修正到 segLen 位置)
+                    for i = 2, n - 1 do
+                        local prev = rope[i - 1]
+                        local node = rope[i]
+                        local dx = node.x - prev.x
+                        local dy = node.y - prev.y
+                        local dist = math.sqrt(dx * dx + dy * dy)
+                        if dist > segLen and dist > 0.001 then
+                            local dirX = dx / dist
+                            local dirY = dy / dist
+                            node.x = prev.x + dirX * segLen
+                            node.y = prev.y + dirY * segLen
+                        end
+                    end
+
+                    -- 反向: 从鱼端向竿尖 (半修正, 避免正反向完全覆盖)
+                    for i = n - 1, 2, -1 do
+                        local nxt = rope[i + 1]
+                        local node = rope[i]
+                        local dx = node.x - nxt.x
+                        local dy = node.y - nxt.y
+                        local dist = math.sqrt(dx * dx + dy * dy)
+                        if dist > segLen and dist > 0.001 then
+                            local dirX = dx / dist
+                            local dirY = dy / dist
+                            local targetX = nxt.x + dirX * segLen
+                            local targetY = nxt.y + dirY * segLen
+                            -- 0.5 混合: 正反两个 pass 各承担一半修正, 结果对称
+                            node.x = node.x + (targetX - node.x) * 0.5
+                            node.y = node.y + (targetY - node.y) * 0.5
+                        end
+                    end
+                end
+
+                -- Pass 3: 张力拉直 — 有张力时将中间节点拉向两端直线
+                -- tensionRatio: 0=完全松弛(保持自然弧线), 1=最大张力(完全绷直)
+                local tensionRatio = math.min(1, fight.tension / CFG.FIGHT_LINE_STRENGTH)
+                if tensionRatio > 0.01 then
+                    -- 张力越大拉直越快, 低张力保留弧度
+                    local straighten = tensionRatio * tensionRatio  -- 二次曲线, 低张力几乎不拉
+                    local r1x, r1y = rope[1].x, rope[1].y  -- 弯曲竿尖位置
+                    for i = 2, n - 1 do
+                        local frac = (i - 1) / (n - 1)  -- 0→1 在线上的位置
+                        local lx = r1x + (fx - r1x) * frac
+                        local ly = r1y + (fy - r1y) * frac
+                        node = rope[i]
+                        node.x = node.x + (lx - node.x) * straighten
+                        node.y = node.y + (ly - node.y) * straighten
+                    end
+                end
+            elseif rod.state == "casting" and rod.flyT ~= nil then
+                -- ═══ casting 模式: 鱼线飞行中, 节点沿直线分布 ═══
+                local ft = math.min(1, rod.flyT)
+                -- 当前鱼饵世界位置 (沿起点→目标线性插值)
+                local lureX = rod.flyStartX + (rod.flyTargetX - rod.flyStartX) * ft
+                local lureY = rod.flyStartY + (rod.flyTargetY - rod.flyStartY) * ft
+                -- 将节点均匀分布在竿尖(rope[1], 已含 stackYOff)和鱼饵之间
+                local r1x, r1y = rope[1].x, rope[1].y
+                for k = 2, n do
+                    local frac = (k - 1) / (n - 1)
+                    rope[k].x = r1x + (lureX - r1x) * frac
+                    rope[k].y = r1y + (lureY - r1y) * frac
+                end
+            else
+                -- ═══ 非 fight 模式: 单向链式 (原逻辑) ═══
+                local segLen = CFG.LINE_LENGTH / CFG.ROPE_SEGMENTS
+                local maxStretch = segLen * 1.15
+                for i = 2, n do
+                    local prev = rope[i - 1]
+                    local node = rope[i]
+                    local dx = node.x - prev.x
+                    local dy = node.y - prev.y
+                    local dist = math.sqrt(dx * dx + dy * dy)
+                    if dist > 0.001 then
+                        local dirX = dx / dist
+                        local dirY = dy / dist
+                        local targetX = prev.x + dirX * segLen
+                        local targetY = prev.y + dirY * segLen
+                        if dist > segLen then
+                            node.x = node.x + (targetX - node.x) * t
+                            node.y = node.y + (targetY - node.y) * t
+                        end
+                        local dx2 = node.x - prev.x
+                        local dy2 = node.y - prev.y
+                        local dist2 = math.sqrt(dx2 * dx2 + dy2 * dy2)
+                        if dist2 > maxStretch then
+                            node.x = prev.x + (dx2 / dist2) * maxStretch
+                            node.y = prev.y + (dy2 / dist2) * maxStretch
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- 鱼选择
+-- ============================================================================
+
+function PickRandomFish()
+    -- 根据钓鱼时长加权 (越久越可能钓到稀有鱼)
+    local trollTime = rods[activeRod].timer
+    local weights = {}
+    local totalW = 0
+    for i, f in ipairs(FISH_TYPES) do
+        local w = math.max(0.1, 6 - f.diff)
+        if trollTime > 5 then w = w + (f.diff - 1) * (trollTime / 8) end
+        weights[i] = w
+        totalW = totalW + w
+    end
+    local r = math.random() * totalW
+    local acc = 0
+    for i, w in ipairs(weights) do
+        acc = acc + w
+        if r <= acc then
+            local f = FISH_TYPES[i]
+            local weight = f.wMin + math.random() * (f.wMax - f.wMin)
+            weight = math.floor(weight * 10 + 0.5) / 10
+            return { type = f, weight = weight }
+        end
+    end
+    local f = FISH_TYPES[1]
+    return { type = f, weight = f.wMin + math.random() * (f.wMax - f.wMin) }
+end
+
+-- ============================================================================
+-- 遛鱼系统
+-- ============================================================================
+
+-- ── 波动生成辅助函数 ──
+
+--- 随机生成径向波动参数 (控制鱼的逃跑力度变化)
+function GenerateRadialWave()
+    local ft = curFish and curFish.type or FISH_TYPES[1]
+    local d = (ft.diff - 1) / 4  -- 难度系数: diff1=0, diff5=1
+
+    fight.radWaveTime = 0
+    if fight.radState == "active" then
+        fight.radWaveDur = 0.7 + math.random() * 1.3        -- 大振幅: 0.7~2.0秒
+    else
+        fight.radWaveDur = 1.5 + math.random() * 3.0        -- 小振幅: 1.5~4.5秒
+    end
+    fight.radWaveBase = 0.65 + math.random() * 0.2 - 0.2 * d -- diff1: 0.65~0.85, diff5: 0.45~0.65
+    -- 振幅由 ChangeRadialState 控制, 不再在此生成
+end
+
+--- 切换径向振幅状态 (calm=小幅波动, active=大幅波动)
+function ChangeRadialState()
+    local ft = curFish and curFish.type or FISH_TYPES[1]
+    local d = (ft.diff - 1) / 4  -- 难度系数: diff1=0, diff5=1
+
+    if math.random() < ft.calmProb then
+        fight.radState = "calm"
+        fight.radStateDur = 3.0 + math.random() * 4.0    -- 平静期 3~7秒
+        -- 小振幅: 基线的 10%~50%, 按难度缩放
+        local lo = 0.10 + 0.10 * d  -- diff1: 10%, diff5: 20%
+        local hi = 0.30 + 0.20 * d  -- diff1: 30%, diff5: 50%
+        fight.radAmpPctTarget = lo + math.random() * (hi - lo)
+    else
+        fight.radState = "active"
+        fight.radStateDur = 1.5 + math.random() * 3.0    -- 暴走期 1.5~4.5秒
+        -- 大振幅: 基线的 35%~75%, 按难度缩放
+        local lo = 0.35 + 0.10 * d  -- diff1: 35%, diff5: 45%
+        local hi = 0.50 + 0.25 * d  -- diff1: 50%, diff5: 75%
+        fight.radAmpPctTarget = lo + math.random() * (hi - lo)
+    end
+    fight.radStateTimer = 0
+end
+
+--- 切换切向行为状态 (CALM=温和摆动, ACTIVE=剧烈横游)
+function ChangeTangentialState()
+    local ft = curFish and curFish.type or FISH_TYPES[1]
+    if math.random() < ft.calmProb then
+        fight.tanState = "calm"
+        fight.tanDuration = 2.0 + math.random() * 4.0  -- CALM持续 2~6秒
+        fight.tanWaveAmp  = 1 + math.random() * 3      -- 小振幅 1~4
+        fight.tanWaveBase = (math.random() - 0.5) * 2   -- 基础偏移 -1~1
+    else
+        fight.tanState = "active"
+        fight.tanDuration = 1.0 + math.random() * 2.0  -- ACTIVE持续 1~3秒
+        fight.tanWaveAmp  = 38 + math.random() * 4     -- 大振幅 38~42
+        fight.tanWaveBase = (math.random() - 0.5) * 10  -- 基础偏移 -5~5
+    end
+    fight.tanTimer    = 0
+    fight.tanWaveTime = 0
+    fight.tanWaveDur  = 0.8 + math.random() * 2.0  -- 切向波形周期 0.8~2.8秒
+end
+
+function StartFight(fish)
+    STATE = "fight"
+    curFish = fish
+    local ft = fish.type
+
+    -- 线与张力
+    fight.tension      = 0
+    fight.tensionVisual = 0
+    fight.dragGear     = CFG.FIGHT_DRAG_DEFAULT_GEAR
+    fight.drag         = fight.dragGear / CFG.FIGHT_DRAG_GEARS * CFG.FIGHT_DRAG_MAX_RATIO
+
+    -- 极坐标: 从绳索末端实际位置反算, 确保拖钓→遛鱼无缝衔接
+    local rod = rods[activeRod]
+    local ax, ay = GetRotatedTipWorld(activeRod)
+    local endX, endY = ax, ay
+    if #rod.rope > 0 then
+        local last = rod.rope[#rod.rope]
+        endX, endY = last.x, last.y
+    end
+    local dx = endX - ax
+    local dy = endY - ay
+    local dist = math.sqrt(dx * dx + dy * dy)
+    fight.fishRadius    = math.max(20, dist)  -- 不小于20, 避免零距离
+    fight.fishInitAngle = math.atan(dx, -dy)  -- 与 GetFishWorldPos 的角度约定一致
+    fight.fishAngle     = 0                   -- 偏转角 = 0 (在初始方向上)
+    fight.lineLength    = fight.fishRadius     -- 线长 = 鱼距, 无松弛
+    fight.fishRadVel    = 0
+    fight.fishAngVel    = 0
+
+    -- 波动初始化
+    GenerateRadialWave()
+    ChangeRadialState()
+    fight.radAmpPct = fight.radAmpPctTarget  -- 初始无需过渡
+    ChangeTangentialState()
+
+    -- 挣扎微力
+    fight.tremorPhase   = math.random() * math.pi * 2  -- 基频初始相位
+    fight.tremorPhase2  = math.random() * math.pi * 2  -- 二次谐波初始相位
+    fight.jerkTimer     = 0
+    fight.jerkDurTotal  = 0                             -- 甩头总时长(包络用)
+    fight.jerkCooldown  = 0.5 + math.random() * 1.0    -- 更短初始冷却, 让玩家更快感受到
+    fight.jerkAmp       = 0
+
+    -- 打滑 (约束派生)
+    fight.slipping      = false
+    fight.slipSpeed     = 0
+
+    -- 收线
+    fight.reeling       = false
+    fight.reelSpeed     = 0
+
+    -- 视觉平滑
+    fight.slipRecentTimer = 0
+
+    -- 体力
+    fight.fishStamina   = ft.stamina
+    fight.fishMaxStam   = ft.stamina
+
+    -- 断线延迟
+    fight.breakTimer    = 0
+    fight.breakDelay    = 0
+
+    -- 抬杆 (右键压杆)
+    fight.liftT         = 0    -- 抬起进度 0~1
+    fight.liftHeight    = 0    -- 当前抬起的世界空间高度 (米)
+
+    -- 元数据
+    fight.fightTime     = 0
+    fight.resultTimer   = 0
+
+    -- 初始化世界坐标缓存 (供船位移补偿)
+    fight.fishWorldX, fight.fishWorldY = GetFishWorldPos()
+    fight.fishHeading = fight.fishInitAngle  -- 鱼影初始朝向 = 初始极角方向
+
+    -- 进入 fight 时保留巡航状态 (巡航限速25%, 玩家可转向或S退出)
+
+    if boat.cruise then
+        ShowNotify("鱼上钩了! 按住左键收线 | 巡航25%限速 | AD转向追鱼", 255, 220, 50)
+    else
+        ShowNotify("鱼上钩了! 按住左键收线 | AD转向", 255, 220, 50)
+    end
+end
+
+-- ============================================================================
+-- 更新逻辑
+-- ============================================================================
+
+---@param eventType string
+---@param eventData UpdateEventData
+function HandleUpdate(eventType, eventData)
+    local dt = eventData["TimeStep"]:GetFloat()
+    gameTime = gameTime + dt
+    waterTime = waterTime + dt
+    screenW = graphics:GetWidth()
+    screenH = graphics:GetHeight()
+
+    -- 海浪精灵 (全状态更新)
+    UpdateWaveSprites(dt)
+
+    -- 通知倒计时
+    if notify.timer > 0 then notify.timer = notify.timer - dt end
+
+    -- ── 海域分区检测（带去抖：持续驻留 1 秒才确认切换）──────────────
+    local zoneGray = MapSampler.Sample("zone", boat.x, boat.y)
+    local rawR = math.floor(zoneGray * 255 + 0.5)
+    -- 量化到最近的已知 R 值
+    local bestR, bestDiff = 190, 999
+    for r, _ in pairs(ZONE_TABLE) do
+        local diff = math.abs(rawR - r)
+        if diff < bestDiff then bestDiff = diff; bestR = r end
+    end
+    if bestR ~= targetZoneR then
+        -- 采样到的区域与当前已确认区域不同
+        if bestR == pendingZoneR then
+            -- 与候选区域一致，累加驻留时间
+            pendingZoneTime = pendingZoneTime + dt
+            if pendingZoneTime >= ZONE_DEBOUNCE then
+                -- 驻留达标，确认切换
+                currentZoneR = targetZoneR
+                targetZoneR = bestR
+                zoneColorT = 0
+                local info = ZONE_TABLE[bestR]
+                if info then
+                    zoneNotify.text = info[3]
+                    zoneNotify.timer = 3.0
+                    zoneNotify.alpha = 255
+                end
+                pendingZoneTime = 0
+            end
+        else
+            -- 新的候选区域，重置计时
+            pendingZoneR = bestR
+            pendingZoneTime = dt
+        end
+    else
+        -- 回到当前区域，清除候选
+        pendingZoneR = targetZoneR
+        pendingZoneTime = 0
+    end
+    -- 颜色过渡
+    if zoneColorT < 1.0 then
+        zoneColorT = math.min(1.0, zoneColorT + dt * ZONE_FADE_SPEED)
+    end
+    -- 区域通知淡出
+    if zoneNotify.timer > 0 then
+        zoneNotify.timer = zoneNotify.timer - dt
+        if zoneNotify.timer < 1.0 then
+            zoneNotify.alpha = math.floor(255 * zoneNotify.timer)
+        end
+    end
+
+    -- 处理虚拟输入
+    UpdateVirtualInput(dt)
+
+    -- 按状态更新
+    if STATE == "menu" then
+        -- 等待按键
+    elseif STATE == "sailing" then
+        UpdateBoat(dt)
+        UpdateWake(dt)
+        UpdateFishShadows(dt)
+        UpdateFloatingPlanks(dt)
+        UpdateCasting(dt)
+        UpdateRods(dt)
+        UpdateStrike(dt)
+        UpdateRodAim(dt)
+        UpdateRopes(dt)
+    elseif STATE == "fight" then
+        UpdateBoat(dt)
+        UpdateWake(dt)
+        UpdateRodAim(dt)
+        UpdateRopes(dt)
+        UpdateFight(dt)
+    elseif STATE == "catch" or STATE == "fail" then
+        -- 等待确认
+    end
+end
+
+function UpdateBoat(dt)
+    if mapOpen then return end
+    local inFight = (STATE == "fight")
+
+    -- 键盘输入
+    local turnDir = 0
+    local accel = false
+    if input:GetKeyDown(KEY_A) or input:GetKeyDown(KEY_LEFT) then turnDir = turnDir - 1 end
+    if input:GetKeyDown(KEY_D) or input:GetKeyDown(KEY_RIGHT) then turnDir = turnDir + 1 end
+
+    -- W 键: 遛鱼时禁止主动加速
+    if not inFight then
+        if input:GetKeyDown(KEY_W) or input:GetKeyDown(KEY_UP) then accel = true end
+    end
+
+    -- S 键: 减速 + 退出巡航 (遛鱼时也有效)
+    if input:GetKeyDown(KEY_S) or input:GetKeyDown(KEY_DOWN) then
+        boat.cruise = false
+        boat.speed = math.max(0, boat.speed - CFG.BOAT_DECEL * 2 * dt)
+    end
+
+    -- 巡航模式
+    if boat.cruise then
+        if inFight then
+            accel = true
+        else
+            accel = true
+        end
+    end
+
+    -- 虚拟摇杆输入
+    if vJoy.active then
+        local jLen = math.sqrt(vJoy.dx * vJoy.dx + vJoy.dy * vJoy.dy)
+        if jLen > 0.2 then
+            if not inFight then
+                accel = true
+            end
+            local targetAngle = math.atan(vJoy.dx, -vJoy.dy)
+            local diff = targetAngle - boat.angle
+            while diff > math.pi do diff = diff - 2 * math.pi end
+            while diff < -math.pi do diff = diff + 2 * math.pi end
+            if math.abs(diff) > 0.05 then
+                turnDir = diff > 0 and 1 or -1
+            end
+        end
+    end
+
+    -- 燃油消耗: 行驶时每秒消耗 1
+    if boat.speed > 0 then
+        PlayerData.ConsumeFuel(1.0 * dt)
+    end
+    -- 燃油耗尽: 禁止加速, 自然减速到停
+    if not PlayerData.HasFuel() then
+        accel = false
+        boat.cruise = false
+    end
+
+    -- 加速 / 减速
+    local maxSpd = CFG.BOAT_MAX_SPEED
+    local accelRate = CFG.BOAT_ACCEL
+    if inFight then
+        maxSpd = CFG.BOAT_MAX_SPEED * 0.25
+        accelRate = CFG.BOAT_ACCEL * 0.5
+    elseif boat.cruise then
+        maxSpd = CFG.BOAT_MAX_SPEED * 0.5
+    end
+
+    -- 转向 (角速度按速度比例缩放, 保持转弯半径一致)
+    if turnDir ~= 0 and boat.speed > 5 then
+        local spdRatio = math.min(1, boat.speed / CFG.BOAT_MAX_SPEED)
+        local turnSpd = CFG.BOAT_TURN_SPEED * math.max(0.2, spdRatio)
+        boat.angle = boat.angle + turnDir * turnSpd * dt
+    end
+    if accel then
+        boat.speed = math.min(maxSpd, boat.speed + accelRate * dt)
+    else
+        boat.speed = math.max(0, boat.speed - CFG.BOAT_DECEL * dt)
+    end
+    -- 如果当前速度超过限速(刚进入fight), 平滑减到限速
+    if boat.speed > maxSpd then
+        boat.speed = math.max(maxSpd, boat.speed - CFG.BOAT_DECEL * dt)
+    end
+
+    -- 移动
+    local dx = math.sin(boat.angle) * boat.speed * dt
+    local dy = -math.cos(boat.angle) * boat.speed * dt
+    boat.x = boat.x + dx
+    boat.y = boat.y + dy
+
+    -- 相机跟随
+    if inFight then
+        -- 遛鱼时: 相机偏移到船和鱼的中点方向, 保持两者都在视野内
+        local fx, fy = GetFishWorldPos()
+        -- 相机目标 = 船位 + 30%偏移向鱼 (偏向船, 鱼在视野边缘)
+        local camTargetX = boat.x + (fx - boat.x) * 0.3
+        local camTargetY = boat.y + (fy - boat.y) * 0.3
+        local lerpSpeed = 3.0 * dt
+        camX = camX + (camTargetX - camX) * lerpSpeed
+        camY = camY + (camTargetY - camY) * lerpSpeed
+    else
+        local lerpSpeed = 5.0 * dt
+        camX = camX + (boat.x - camX) * lerpSpeed
+        camY = camY + (boat.y - camY) * lerpSpeed
+    end
+
+    -- 相机缩放
+    if inFight then
+        -- 固定2倍放大, 让鱼的运动在屏幕上显得更快
+        camScaleTarget = 2.0
+    else
+        camScaleTarget = 1.0
+    end
+    camScale = camScale + (camScaleTarget - camScale) * 3.0 * dt
+end
+
+function UpdateWake(dt)
+    -- 生成尾流
+    if boat.speed > 15 then
+        local backX = boat.x - math.sin(boat.angle) * CFG.BOAT_LENGTH * 0.7
+        local backY = boat.y + math.cos(boat.angle) * CFG.BOAT_LENGTH * 0.7
+        local spread = 5
+        table.insert(wakeParticles, {
+            x = backX + (math.random() - 0.5) * spread,
+            y = backY + (math.random() - 0.5) * spread,
+            life = 1.5,
+            maxLife = 1.5,
+            size = 3 + math.random() * 3,
+        })
+    end
+
+    -- 更新
+    for i = #wakeParticles, 1, -1 do
+        local p = wakeParticles[i]
+        p.life = p.life - dt
+        p.size = p.size + dt * 2
+        if p.life <= 0 then
+            table.remove(wakeParticles, i)
+        end
+    end
+
+    -- 限制数量
+    while #wakeParticles > 200 do
+        table.remove(wakeParticles, 1)
+    end
+end
+
+function UpdateFishShadows(dt)
+    for _, fs in ipairs(fishShadows) do
+        fs.wobble = fs.wobble + dt * 3
+        fs.attracted = false
+
+        -- 检查所有正在拖钓的鱼竿，鱼影被最近的鱼饵吸引
+        if boat.speed > 10 then
+            for ri = 1, CFG.ROD_COUNT do
+                if rods[ri].state == "trolling" then
+                    local lureX, lureY = GetLurePosition(ri)
+                    local dx = lureX - fs.x
+                    local dy = lureY - fs.y
+                    local dist = math.sqrt(dx * dx + dy * dy)
+                    if dist < 200 then
+                        fs.attracted = true
+                        local attract = math.max(0, 1 - dist / 200) * 40
+                        fs.x = fs.x + (dx / dist) * attract * dt
+                        fs.y = fs.y + (dy / dist) * attract * dt
+                    end
+                end
+            end
+        end
+
+        -- 随机游动
+        fs.angle = fs.angle + (math.random() - 0.5) * 2 * dt
+        fs.x = fs.x + math.cos(fs.angle) * fs.speed * dt
+        fs.y = fs.y + math.sin(fs.angle) * fs.speed * dt
+
+        -- 离太远则拉回来
+        local dx = fs.x - boat.x
+        local dy = fs.y - boat.y
+        local dist = math.sqrt(dx * dx + dy * dy)
+        if dist > 500 then
+            fs.angle = math.atan(boat.y - fs.y, boat.x - fs.x)
+        end
+    end
+end
+
+function UpdateRods(dt)
+    for i = 1, CFG.ROD_COUNT do
+        local rod = rods[i]
+        if rod.state == "trolling" then
+            rod.timer = rod.timer + dt
+            if rod.timer >= rod.biteAt then
+                -- 鱼咬钩!
+                rod.state = "bite"
+                rod.biteTimer = CFG.BITE_WINDOW
+                activeRod = i  -- 自动切换到咬钩的鱼竿
+                ShowNotify("鱼竿" .. i .. " 鱼咬钩了! 快按空格提竿!", 255, 220, 50)
+            end
+        elseif rod.state == "bite" then
+            rod.biteTimer = rod.biteTimer - dt
+            if rod.biteTimer <= 0 then
+                -- 超时未反应, 鱼跑了
+                rod.state = "trolling"
+                rod.timer = 0
+                rod.biteAt = RandomBiteTime()
+                ShowNotify("鱼竿" .. i .. " 鱼跑了...反应太慢!", 255, 100, 100)
+            end
+        end
+    end
+end
+
+-- ── 抬杆动画 ──
+function UpdateStrike(dt)
+    if not strikeState.active then return end
+
+    strikeState.timer = strikeState.timer + dt
+
+    -- 动画结束 → 进入遛鱼
+    if strikeState.timer >= CFG.STRIKE_DURATION then
+        strikeState.active = false
+
+        local rod = rods[strikeState.rodIndex]
+        rod.state = "trolling"  -- 保持线在水中
+        rod.timer = 0
+
+        -- 恢复镜头缩放
+        camScaleTarget = camScaleTarget - CFG.STRIKE_ZOOM_PUNCH
+
+        -- 进入遛鱼
+        activeRod = strikeState.rodIndex
+        StartFight(strikeState.fish)
+        strikeState.fish = nil
+    end
+end
+
+-- ── 抛竿蓄力/飞行/落水 ──
+function UpdateCasting(dt)
+    local rod = rods[activeRod]
+
+    -- ── 1. 飞行中: 推进鱼线飞行进度 ──
+    if rod.state == "casting" then
+        rod.flyT = rod.flyT + dt / rod.flyDuration
+        if rod.flyT >= 1.0 then
+            -- 落水! 转入拖钓
+            rod.flyT = 1.0
+            rod.state = "trolling"
+            rod.timer = 0
+            rod.biteAt = RandomBiteTime()
+            ShowNotify("鱼竿" .. activeRod .. " 落水! 等待咬钩", 100, 200, 255)
+        end
+        return  -- 飞行中不处理蓄力输入
+    end
+
+    -- ── 2. 蓄力输入 (仅 sailing + rod idle) ──
+    if STATE ~= "sailing" or rod.state ~= "idle" then
+        castState.charging = false
+        castState.power = 0
+        return
+    end
+
+    local mouseDown = input:GetMouseButtonDown(MOUSEB_LEFT)
+    local mx = input:GetMousePosition().x
+    local my = input:GetMousePosition().y
+
+    -- 排除虚拟摇杆区域和动作按钮区域
+    local joyZone = (mx < screenW * 0.4) and (my > screenH * 0.55)
+    local btnCX = screenW - 60
+    local btnCY = screenH - 80
+    local btnDist = math.sqrt((mx - btnCX)^2 + (my - btnCY)^2)
+    local btnZone = btnDist < CFG.ACTION_BTN_R * 1.5
+
+    if castState.charging then
+        -- ── 已在蓄力中: 只看鼠标是否仍按下, 不再检查区域 ──
+        if mouseDown then
+            castState.power = math.min(1.0, castState.power + dt / CFG.CAST_CHARGE_TIME)
+        else
+            -- 松开鼠标 → 释放抛投!
+            castState.charging = false
+
+            -- 计算方向: 从旋转后竿尖指向鼠标世界位置
+            local ax, ay = GetRotatedTipWorld(activeRod)
+            local mwx, mwy = ScreenToWorld(mx, my)
+            local dx = mwx - ax
+            local dy = mwy - ay
+            local dist = math.sqrt(dx * dx + dy * dy)
+            if dist < 1 then dx, dy = 0, -1; dist = 1 end  -- 防零向量
+            dx, dy = dx / dist, dy / dist
+
+            -- 抛投距离 = 最小 + (最大-最小) * 力度
+            local castDist = CFG.CAST_MIN_DIST + (CFG.CAST_MAX_DIST - CFG.CAST_MIN_DIST) * castState.power
+
+            -- 设置飞行参数
+            rod.flyStartX = ax
+            rod.flyStartY = ay
+            rod.flyTargetX = ax + dx * castDist
+            rod.flyTargetY = ay + dy * castDist
+            rod.flyT = 0
+            rod.flyDuration = castDist / CFG.CAST_FLY_SPEED
+
+            -- 初始化绳索 (所有节点从竿尖出发)
+            local segments = CFG.ROPE_SEGMENTS
+            rod.rope = {}
+            for i = 1, segments + 1 do
+                rod.rope[i] = { x = ax, y = ay, px = ax, py = ay }
+            end
+
+            rod.state = "casting"
+            castState.power = 0
+        end
+    elseif mouseDown and not joyZone and not btnZone then
+        -- ── 开始新的蓄力 (仅在非摇杆/按钮区域才能开始) ──
+        castState.charging = true
+        castState.power = 0
+    end
+end
+
+-- ── 鱼 AI (极坐标物理: 径向逃跑 + 切向游动) ──
+function UpdateFishAI(dt)
+    if not curFish then return end
+    local ft = curFish.type
+    local mass = CFG.FISH_MASS
+    local dragC = CFG.FISH_DRAG_COEFF
+
+    -- 体力衰减因子: 体力越低, 力量越弱
+    local stamRatio = fight.fishStamina / fight.fishMaxStam
+    local staminaFactor = 0.2 + 0.8 * stamRatio  -- 最低保留20%力量
+
+    -- ════════════════════════════════════════
+    -- 径向力 (radial: 鱼试图远离竿尖)
+    -- ════════════════════════════════════════
+
+    -- 波形周期更新
+    fight.radWaveTime = fight.radWaveTime + dt
+    if fight.radWaveTime >= fight.radWaveDur then
+        GenerateRadialWave()
+    end
+
+    -- 径向状态更新 (calm/active 切换)
+    fight.radStateTimer = fight.radStateTimer + dt
+    if fight.radStateTimer >= fight.radStateDur then
+        ChangeRadialState()
+    end
+
+    -- 振幅百分比平滑过渡 (约2秒完成切换)
+    local ampSmoothT = 1.0 - math.exp(-2.0 * dt)
+    fight.radAmpPct = fight.radAmpPct +
+        (fight.radAmpPctTarget - fight.radAmpPct) * ampSmoothT
+
+    -- sin 波形: 基础值 + 基线*振幅百分比 * sin(相位)
+    local radPhase = (fight.radWaveTime / fight.radWaveDur) * math.pi * 2
+    local actualAmp = fight.radWaveBase * fight.radAmpPct
+    local radialPullPct = fight.radWaveBase + actualAmp * math.sin(radPhase)
+    -- >1.0 → 力超maxForce(断线风险), <0 → 负径向力/鱼朝你游(空力期)
+
+    local forceRadial
+    if ft.testFixed then
+        forceRadial = ft.maxForce  -- 测试鱼: 恒定力, 不受波动/体力影响
+    else
+        forceRadial = ft.maxForce * radialPullPct * staminaFactor
+    end
+
+    -- ════════════════════════════════════════
+    -- 挣扎微力 (tremor: 持续颤动 + jerk: 随机甩头)
+    -- ════════════════════════════════════════
+    if not ft.testFixed then
+        local d = (ft.diff - 1) / 4   -- 0~1 难度系数
+
+        -- (1) 颤动: 双频正弦叠加, 模拟鱼尾/身体摆动
+        local freq1 = 8 + d * 6                     -- 基频 8~14 Hz
+        local freq2 = freq1 * 2.3 + 1.7             -- 二次谐波(非整数倍, 更自然)
+        fight.tremorPhase  = fight.tremorPhase  + freq1 * math.pi * 2 * dt
+        fight.tremorPhase2 = fight.tremorPhase2 + freq2 * math.pi * 2 * dt
+        local tremorAmpPct = 0.06 + d * 0.06        -- 6%~12% of maxForce (原来2%~5%)
+        if fight.radState == "active" then
+            tremorAmpPct = tremorAmpPct * 2.0        -- active 时颤动翻倍
+        end
+        local tremorWave = math.sin(fight.tremorPhase) * 0.7
+                         + math.sin(fight.tremorPhase2) * 0.3   -- 双频叠加
+        local tremorForce = ft.maxForce * tremorAmpPct * tremorWave * staminaFactor
+
+        -- (2) 甩头: 不定时短促脉冲, 模拟猛甩头/冲刺
+        local jerkForce = 0
+        if fight.jerkTimer > 0 then
+            -- 甩头进行中: 半正弦包络 (快起快落)
+            fight.jerkTimer = fight.jerkTimer - dt
+            if fight.jerkTimer <= 0 then
+                fight.jerkTimer = 0
+                fight.jerkCooldown = 0.3 + math.random() * (1.5 - d * 0.8)  -- 冷却更短
+            else
+                local progress = 1.0 - fight.jerkTimer / fight.jerkDurTotal  -- 用存储的总时长
+                local envelope = math.sin(progress * math.pi)  -- 0→1→0 包络
+                local jerkAmpPct = 0.12 + d * 0.13             -- 12%~25% of maxForce (原来5%~15%)
+                jerkForce = ft.maxForce * jerkAmpPct * fight.jerkAmp * envelope * staminaFactor
+            end
+        else
+            -- 冷却中
+            fight.jerkCooldown = fight.jerkCooldown - dt
+            if fight.jerkCooldown <= 0 then
+                -- 触发新的甩头
+                local dur = 0.12 + math.random() * 0.25        -- 持续 0.12~0.37 秒
+                fight.jerkTimer    = dur
+                fight.jerkDurTotal = dur                        -- 存下总时长给包络用
+                fight.jerkAmp = math.random() > 0.5 and 1 or -1  -- 随机方向
+                if fight.radState == "active" then
+                    fight.jerkAmp = fight.jerkAmp * 1.6         -- active 时更猛
+                end
+            end
+        end
+
+        forceRadial = forceRadial + tremorForce + jerkForce
+    end
+
+    -- ════════════════════════════════════════
+    -- 切向力 (tangential: 鱼左右摆动/横游)
+    -- ════════════════════════════════════════
+
+    -- 状态计时
+    fight.tanTimer = fight.tanTimer + dt
+    if fight.tanTimer >= fight.tanDuration then
+        ChangeTangentialState()
+    end
+    -- sin 波形
+    fight.tanWaveTime = fight.tanWaveTime + dt
+    if fight.tanWaveTime >= fight.tanWaveDur then
+        fight.tanWaveTime = fight.tanWaveTime - fight.tanWaveDur
+    end
+    local tanPhase = (fight.tanWaveTime / fight.tanWaveDur) * math.pi * 2
+    local tangentialPull = fight.tanWaveBase + fight.tanWaveAmp * math.sin(tanPhase)
+    tangentialPull = math.max(-1, math.min(1, tangentialPull)) * staminaFactor
+
+    -- ════════════════════════════════════════
+    -- 角度限制 (余弦阻尼 + 恢复力)
+    -- ════════════════════════════════════════
+
+    local maxAngleRad = math.rad(CFG.FISH_MAX_ANGLE)
+    local dampStartRad = math.rad(CFG.FISH_ANGLE_DAMP_START)
+    local angleDiff = math.abs(fight.fishAngle)
+
+    -- 超过阻尼起始角度后, 切向力逐渐被削弱
+    if angleDiff > dampStartRad then
+        local t = math.min(1, (angleDiff - dampStartRad) / (maxAngleRad - dampStartRad))
+        local damping = math.cos(t * math.pi * 0.5)  -- 1→0 余弦衰减
+        tangentialPull = tangentialPull * damping
+    end
+
+    -- 恢复力: 偏转角越大, 越强的回正力
+    local restoreForce = 0
+    if angleDiff > dampStartRad then
+        local sign = fight.fishAngle > 0 and -1 or 1
+        restoreForce = sign * CFG.FISH_RESTORE_STR *
+            ((angleDiff - dampStartRad) / (maxAngleRad - dampStartRad))
+    end
+
+    local forceTangential = tangentialPull * ft.maxForce * 0.5 + restoreForce
+
+    -- ════════════════════════════════════════
+    -- 径向物理 (牛顿力学)
+    -- ════════════════════════════════════════
+
+    local radius = math.max(1, fight.fishRadius)  -- 防止除零
+
+    -- 离心力 (角运动产生的径向分量)
+    local centrifugal = mass * fight.fishAngVel * fight.fishAngVel * radius
+
+    -- 张力对径向的抑制 (线拉住鱼, 阻止远离)
+    local tensionRadial = fight.tension  -- 张力直接抵消径向速度
+
+    -- 径向合力 = 逃跑力 + 离心力 - 张力阻抗 - 水阻力
+    local netRadial = forceRadial + centrifugal - tensionRadial
+        - fight.fishRadVel * dragC
+
+    -- 加速度 → 速度 → 位置
+    fight.fishRadVel = fight.fishRadVel + (netRadial / mass) * dt
+    -- 速度限制
+    fight.fishRadVel = math.max(-CFG.FISH_SPEED_CAP,
+        math.min(CFG.FISH_SPEED_CAP, fight.fishRadVel))
+    fight.fishRadius = fight.fishRadius + fight.fishRadVel * dt
+    fight.fishRadius = math.max(0, fight.fishRadius)  -- 不能为负
+
+    -- ════════════════════════════════════════
+    -- 切向物理 (线速度模型)
+    -- ════════════════════════════════════════
+
+    -- 角速度 → 线速度
+    local tangentialSpeed = fight.fishAngVel * radius
+
+    -- 切向合力 = 横游力 - 水阻力
+    local netTangent = forceTangential - tangentialSpeed * dragC
+    tangentialSpeed = tangentialSpeed + (netTangent / mass) * dt
+    -- 速度限制
+    tangentialSpeed = math.max(-CFG.FISH_TAN_SPEED_CAP,
+        math.min(CFG.FISH_TAN_SPEED_CAP, tangentialSpeed))
+
+    -- 线速度 → 角速度
+    fight.fishAngVel = tangentialSpeed / radius
+    fight.fishAngle = fight.fishAngle + fight.fishAngVel * dt
+
+    -- 硬约束角度范围
+    fight.fishAngle = math.max(-maxAngleRad, math.min(maxAngleRad, fight.fishAngle))
+end
+
+-- ── 遛鱼主更新 (弹性张力 + 惯性打滑 + 加速度收线) ──
+function UpdateFight(dt)
+    fight.fightTime = fight.fightTime + dt
+
+    -- 0. 船位移补偿: 鱼在世界空间中保持不动, 重算极坐标
+    --    上一帧末尾缓存了鱼的世界坐标, 本帧 UpdateBoat 已跑完 (船已移动)
+    --    从新竿尖到缓存位置反算 fishRadius / fishAngle
+    if fight.fishWorldX then
+        local ax, ay = GetRotatedTipWorld(activeRod)
+        local dx = fight.fishWorldX - ax
+        local dy = fight.fishWorldY - ay
+        local newRadius = math.sqrt(dx * dx + dy * dy)
+        if newRadius > 0.01 then
+            fight.fishRadius = newRadius
+            -- 反算世界角度, 然后减去 fishInitAngle 得到偏转量
+            local worldAngle = math.atan(dx, -dy)
+            local newAngle = worldAngle - fight.fishInitAngle
+            -- 归一化到 [-pi, pi]
+            while newAngle >  math.pi do newAngle = newAngle - 2 * math.pi end
+            while newAngle < -math.pi do newAngle = newAngle + 2 * math.pi end
+            fight.fishAngle = newAngle
+        end
+    end
+
+    -- 1. 鱼 AI (极坐标物理, 更新 fishRadius/fishAngle)
+    UpdateFishAI(dt)
+
+    -- 2. 玩家输入
+    fight.reeling = input:GetMouseButtonDown(MOUSEB_LEFT) or actionDown
+
+    -- 2b. 右键抬杆 (伪透视压杆) —— 物理节奏优化
+    local lifting = input:GetMouseButtonDown(MOUSEB_RIGHT)
+    if lifting then
+        -- 抬杆: 起步快 → 越高越吃力 (easing), 张力大时更费力
+        local easeFactor = 0.3 + 0.7 * (1.0 - fight.liftT)              -- 顶端只剩 30% 速度
+        local tensionNorm = math.min(1.0, (fight.tension or 0) / CFG.FIGHT_LINE_STRENGTH)
+        local tensionBrake = 1.0 - CFG.FIGHT_LIFT_TENSION_DRAG * tensionNorm -- 满张力时速度 × 0.3
+        local upSpeed = CFG.FIGHT_LIFT_SPEED_UP * easeFactor * tensionBrake
+        fight.liftT = math.min(1.0, fight.liftT + upSpeed * dt)
+    else
+        -- 放杆: 重力加速，杆越高下落越快 (模拟自由落体感)
+        local gravFactor = 0.4 + 0.6 * fight.liftT                      -- 低位 40% 速度, 高位 100%
+        local downSpeed = CFG.FIGHT_LIFT_SPEED_DOWN * gravFactor
+        fight.liftT = math.max(0.0, fight.liftT - downSpeed * dt)
+    end
+    -- 计算抬起高度: 鱼竿长度 × sin(抬起角度)
+    local liftAngle = fight.liftT * CFG.FIGHT_LIFT_MAX_ANGLE
+    local rodLen = GetRodPhysicalLength()
+    fight.liftHeight = rodLen * math.sin(liftAngle)
+
+    -- 3. 刹车调节 (鼠标滚轮换档, 每次±1档)
+    local wheel = input.mouseMoveWheel
+    if wheel ~= 0 then
+        local step = wheel > 0 and 1 or -1
+        fight.dragGear = math.max(0, math.min(CFG.FIGHT_DRAG_GEARS, fight.dragGear + step))
+    end
+    -- 派生刹车比例: 0~29 → 0%~40%, 30 → 锁死(用1.0保证不打滑)
+    if fight.dragGear >= CFG.FIGHT_DRAG_GEARS then
+        fight.drag = 1.0  -- 锁死: dragForce = LINE_STRENGTH, 永不打滑
+    else
+        fight.drag = fight.dragGear / (CFG.FIGHT_DRAG_GEARS - 1) * CFG.FIGHT_DRAG_MAX_RATIO
+    end
+
+    -- ════════════════════════════════════════
+    -- 4. 收线 (张力越大越费力, 有效速度衰减)
+    -- ════════════════════════════════════════
+    if fight.reeling then
+        fight.reelSpeed = math.min(CFG.FIGHT_REEL_MAX,
+            fight.reelSpeed + CFG.FIGHT_REEL_ACCEL * dt)
+        -- 张力衰减: 满载时只剩 10% 效率, 空载 100%
+        local tensionRatio = fight.tension / CFG.FIGHT_LINE_STRENGTH
+        local efficiency = 1.0 - tensionRatio * 0.9
+        fight.effectiveReel = fight.reelSpeed * efficiency
+        fight.lineLength = fight.lineLength - fight.effectiveReel * dt
+    else
+        fight.reelSpeed = 0
+        fight.effectiveReel = 0
+    end
+    fight.lineLength = math.max(0, fight.lineLength)
+
+    -- 收线音效: 播放/停止 + 频率随有效速度变化
+    if fight.reeling and fight.effectiveReel > 0.5 then
+        if not sfxReel:IsPlaying() then
+            sfxReel:Play(sndReel)
+        end
+        -- 频率映射: 低速0.6x(低沉吃力) → 满速1.4x(高亢流畅)
+        local speedRatio = math.min(1, fight.effectiveReel / CFG.FIGHT_REEL_MAX)
+        sfxReel:SetFrequency(44100 * (0.6 + speedRatio * 0.8))
+    else
+        if sfxReel:IsPlaying() then
+            sfxReel:Stop()
+        end
+    end
+
+    -- 卷轮旋转角度累积 (非线性映射, 无张力~5圈/秒, 满张力~0.6圈/秒)
+    -- 幂曲线 ratio^1.75 把 3.3x 速度差放大到 ~8x 视觉差, 慢速时更明显
+    local reelRatio = fight.effectiveReel / CFG.FIGHT_REEL_MAX
+    local reelRPS = 2.5 * (reelRatio ^ 1.75)
+    fight.reelAngle = fight.reelAngle + reelRPS * 2 * math.pi * dt
+    -- 打滑反转
+    local slipRatio = math.min(1, fight.slipSpeed / 30)  -- 30m/s 对应满速反转
+    local slipRPS = 2.5 * (slipRatio ^ 1.75)
+    fight.reelAngle = fight.reelAngle - slipRPS * 2 * math.pi * dt
+
+    -- ════════════════════════════════════════
+    -- 5. 统一约束解算 (卷轮惯性模型)
+    -- ════════════════════════════════════════
+    -- 物理模型: 卷轮有虚拟质量, 张力与刹车力的差值产生加速度.
+    --   netForce = tension - dragForce
+    --   正 → 加速放线(鱼拉力 > 刹车摩擦)
+    --   负 → 减速制动(刹车摩擦 > 当前张力)
+    --   slipSpeed 持续积累, 模拟真实卷轮的惯性响应.
+
+    local dragForce = fight.drag * CFG.FIGHT_LINE_STRENGTH  -- 刹车力(kg)
+
+    -- (a) 当前拉伸量和张力
+    -- 抬杆时用 3D 距离: 水平鱼距 + 竖直抬起高度 → 实际线长
+    local dist3D = math.sqrt(fight.fishRadius * fight.fishRadius + fight.liftHeight * fight.liftHeight)
+    local rawStretch = math.max(0, dist3D - fight.lineLength)
+    local rawTension = math.min(CFG.FIGHT_LINE_STRENGTH,
+        (rawStretch / CFG.FIGHT_STRETCH_MAX) * CFG.FIGHT_LINE_STRENGTH)
+
+    -- (b) 卷轮力学: F=ma, 含粘性阻尼
+    --   netForce = (tension - drag) - damping * speed
+    --   阻尼力与速度成正比, 抑制阈值附近的过冲振荡
+    local dampingForce = CFG.FIGHT_SLIP_DAMPING * fight.slipSpeed
+    local netForce = rawTension - dragForce - dampingForce
+    if netForce > 0 then
+        -- 净力为正: 卷轮加速放线
+        fight.slipSpeed = fight.slipSpeed + (netForce / CFG.FIGHT_SLIP_MASS) * dt
+    elseif fight.slipSpeed > 0 then
+        -- 净力为负但卷轮仍在转: 减速制动
+        local decel = math.abs(netForce) / CFG.FIGHT_SLIP_MASS
+        fight.slipSpeed = math.max(0, fight.slipSpeed - decel * dt)
+    end
+    -- 安全上限
+    fight.slipSpeed = math.min(fight.slipSpeed, CFG.FIGHT_SLIP_SPEED_MAX)
+
+    -- (c) 应用放线
+    local slipDelta = fight.slipSpeed * dt
+    fight.lineLength = fight.lineLength + slipDelta
+
+    -- (d) 重算实际张力 (放线后拉伸量变化, 含抬杆3D距离)
+    local dist3D_post = math.sqrt(fight.fishRadius * fight.fishRadius + fight.liftHeight * fight.liftHeight)
+    local actualStretch = math.max(0, dist3D_post - fight.lineLength)
+    fight.tension = math.min(CFG.FIGHT_LINE_STRENGTH,
+        (actualStretch / CFG.FIGHT_STRETCH_MAX) * CFG.FIGHT_LINE_STRENGTH)
+
+    -- 线长上限钳位
+    fight.lineLength = math.max(0, fight.lineLength)
+
+    -- (e) 打滑状态 (基于放线速度判定)
+    fight.slipping = fight.slipSpeed > 0.1
+    if fight.slipping then
+        fight.slipRecentTimer = CFG.FIGHT_SLIP_MEMORY
+        if not sfxSlip:IsPlaying() then
+            sfxSlip:Play(sndSlip)
+        end
+    else
+        if sfxSlip:IsPlaying() then
+            sfxSlip:Stop()
+        end
+    end
+
+    -- ════════════════════════════════════════
+    -- 5b. 诊断记录 (每帧采样)
+    -- ════════════════════════════════════════
+    if diagEnabled then
+        local elapsed = fight.fightTime - diagStartTime
+        diagLog[#diagLog + 1] = {
+            t        = elapsed,
+            tension  = fight.tension,
+            slipSpd  = fight.slipSpeed,
+            lineLen  = fight.lineLength,
+            dragF    = dragForce,
+            fishR    = fight.fishRadius,
+        }
+    end
+
+    -- 波形图缓冲 (始终采样, 开关只控制显示)
+    diagChartIdx = (diagChartIdx % DIAG_CHART_LEN) + 1
+    diagChartBuf[diagChartIdx] = { tension = fight.tension, dragF = dragForce }
+
+    -- ════════════════════════════════════════
+    -- 6. 显示值直接同步 (约束解算已消除振荡, 无需平滑)
+    -- ════════════════════════════════════════
+    fight.slipRecentTimer = math.max(0, fight.slipRecentTimer - dt)
+    fight.tensionVisual = fight.tension
+
+    -- ════════════════════════════════════════
+    -- 8. 鱼体力消耗
+    -- ════════════════════════════════════════
+    local staminaDrain = (1.0 + fight.tension * 0.04) * 0.2  -- ×0.2 = 慢5倍(调试用)
+    if fight.reeling and not fight.slipping then
+        staminaDrain = staminaDrain + 1.5 * 0.2  -- 被拉向岸边更累
+    end
+    fight.fishStamina = math.max(0, fight.fishStamina - staminaDrain * dt)
+
+    -- ════════════════════════════════════════
+    -- 9. 胜负判定
+    -- ════════════════════════════════════════
+    if fight.tension >= CFG.FIGHT_LINE_STRENGTH then
+        -- 张力满载, 开始/继续断线倒计时
+        if fight.breakTimer <= 0 then
+            fight.breakDelay = 0.2 + math.random() * 0.5  -- 随机 0.2~0.7秒
+        end
+        fight.breakTimer = fight.breakTimer + dt
+        if fight.breakTimer >= fight.breakDelay then
+            -- 断线!
+            sfxSlip:Stop()
+            sfxReel:Stop()
+            STATE = "fail"
+            local rod = rods[activeRod]
+            rod.state = "idle"; rod.timer = 0; rod.rope = {}
+            ShowNotify("断线了! 张力过大!", 255, 80, 80)
+            return
+        end
+    else
+        -- 张力回落, 重置倒计时
+        fight.breakTimer = 0
+    end
+    if fight.lineLength >= CFG.FIGHT_LINE_MAX and not diagInfiniteLine then
+        -- 清杯!
+        sfxSlip:Stop()
+        sfxReel:Stop()
+        STATE = "fail"
+        local rod = rods[activeRod]
+        rod.state = "idle"; rod.timer = 0; rod.rope = {}
+        ShowNotify("清杯了! 线被拽完!", 255, 80, 80)
+        return
+    end
+    if fight.fishRadius <= CFG.FIGHT_CATCH_DIST then
+        -- 鱼被拉到手边, 成功!
+        sfxSlip:Stop()
+        sfxReel:Stop()
+        STATE = "catch"
+        local rod = rods[activeRod]
+        rod.state = "idle"; rod.timer = 0; rod.rope = {}
+        table.insert(caughtList, curFish)
+        totalWeight = totalWeight + curFish.weight
+        ShowNotify("钓到了 " .. curFish.type.name .. "! " ..
+            string.format("%.1f", curFish.weight) .. "kg", 50, 255, 100)
+        return
+    end
+
+    -- 帧末缓存鱼的世界坐标, 供下帧船位移补偿使用
+    local newFX, newFY = GetFishWorldPos()
+
+    -- 计算鱼影朝向: 基于帧间位移方向, 平滑过渡
+    if fight.fishWorldX then
+        local moveDX = newFX - fight.fishWorldX
+        local moveDY = newFY - fight.fishWorldY
+        local moveDist = math.sqrt(moveDX * moveDX + moveDY * moveDY)
+        if moveDist > 0.5 then  -- 有足够位移才更新朝向, 避免静止时抖动
+            local targetHeading = math.atan(moveDX, -moveDY)  -- 与 boat.angle 同系
+            -- 平滑过渡朝向, 避免瞬间转头
+            local diff = targetHeading - (fight.fishHeading or targetHeading)
+            while diff >  math.pi do diff = diff - 2 * math.pi end
+            while diff < -math.pi do diff = diff + 2 * math.pi end
+            fight.fishHeading = (fight.fishHeading or targetHeading) + diff * math.min(1, 8.0 * dt)
+        end
+    end
+    if not fight.fishHeading then
+        fight.fishHeading = fight.fishInitAngle + fight.fishAngle  -- 初始用极坐标方向
+    end
+
+    fight.fishWorldX, fight.fishWorldY = newFX, newFY
+end
+
+function GetLurePosition(rodIndex)
+    rodIndex = rodIndex or activeRod
+    local rod = rods[rodIndex]
+    -- 如果有绳索物理数据，返回末端节点位置
+    if #rod.rope > 0 then
+        local last = rod.rope[#rod.rope]
+        return last.x, last.y
+    end
+    -- 回退: 无绳索时从竿尖向后计算
+    local ax, ay = GetRodAnchor(rodIndex)
+    local outAngle = boat.angle + rod.side * 0.3
+    local lx = ax + math.sin(outAngle) * CFG.LINE_LENGTH
+    local ly = ay - math.cos(outAngle) * CFG.LINE_LENGTH
+    return lx, ly
+end
+
+-- ============================================================================
+-- 虚拟输入
+-- ============================================================================
+
+function UpdateVirtualInput(dt)
+    local isDown = input:GetMouseButtonDown(MOUSEB_LEFT)
+    prevActionDown = actionDown
+    actionDown = false
+    actionJustPressed = false
+
+    if isDown then
+        local mx = input:GetMousePosition().x
+        local my = input:GetMousePosition().y
+
+        -- 蓄力抛竿期间, 跳过虚拟摇杆和动作按钮
+        if castState.charging then
+            -- 不处理其他触摸区域
+        else
+
+        -- 虚拟摇杆区域 (左下)
+        local joyZone = (mx < screenW * 0.4) and (my > screenH * 0.55)
+        -- 动作按钮区域 (右下)
+        local btnCX = screenW - 60
+        local btnCY = screenH - 80
+        local btnDist = math.sqrt((mx - btnCX)^2 + (my - btnCY)^2)
+        local btnZone = btnDist < CFG.ACTION_BTN_R * 1.5
+
+        if joyZone then
+            if not vJoy.active then
+                vJoy.active = true
+                vJoy.baseX = mx
+                vJoy.baseY = my
+            end
+            local jdx = mx - vJoy.baseX
+            local jdy = my - vJoy.baseY
+            local jdist = math.sqrt(jdx * jdx + jdy * jdy)
+            local maxD = CFG.JOYSTICK_R
+            if jdist > maxD then
+                jdx = jdx / jdist * maxD
+                jdy = jdy / jdist * maxD
+            end
+            vJoy.stickX = vJoy.baseX + jdx
+            vJoy.stickY = vJoy.baseY + jdy
+            if jdist > 8 then
+                vJoy.dx = jdx / maxD
+                vJoy.dy = jdy / maxD
+            else
+                vJoy.dx = 0
+                vJoy.dy = 0
+            end
+        elseif btnZone then
+            actionDown = true
+            if not prevActionDown then
+                actionJustPressed = true
+            end
+        end
+        end -- castState.charging else
+    else
+        vJoy.active = false
+        vJoy.dx = 0
+        vJoy.dy = 0
+    end
+
+    -- 处理动作按钮按下
+    if actionJustPressed then
+        HandleAction()
+    end
+end
+
+-- ============================================================================
+-- 输入处理
+-- ============================================================================
+
+---@param eventType string
+---@param eventData KeyDownEventData
+function HandleKeyDown(eventType, eventData)
+    local key = eventData["Key"]:GetInt()
+
+    -- B 键: 背包开关（同时关闭岛屿菜单）
+    if key == KEY_B then
+        if islandMenuOpen then
+            islandMenuOpen = false
+            dockedIsland = nil
+            IslandMenu.Reset()
+        end
+        inventoryOpen = not inventoryOpen
+        if not inventoryOpen then Inventory.Reset() end
+        return
+    end
+
+    -- 背包打开时拦截按键
+    if inventoryOpen then
+        if key == KEY_ESCAPE then
+            inventoryOpen = false
+            Inventory.Reset()
+        else
+            Inventory.HandleKey(key)
+        end
+        return
+    end
+
+    -- 岛屿菜单打开时拦截按键
+    if islandMenuOpen then
+        if key == KEY_ESCAPE or key == KEY_E then
+            islandMenuOpen = false
+            dockedIsland = nil
+            IslandMenu.Reset()
+        else
+            local consumed, result = IslandMenu.HandleKey(key, {
+                island     = dockedIsland,
+                caughtList = caughtList,
+                PlayerData = PlayerData,
+            })
+            if result and result.soldWeight then
+                totalWeight = totalWeight - result.soldWeight
+                if totalWeight < 0 then totalWeight = 0 end
+                if result.soldCount == 1 then
+                    ShowNotify("卖出 " .. result.fishName .. " +" .. result.income .. " 💰", 255, 220, 80)
+                else
+                    ShowNotify("卖出 " .. result.soldCount .. " 条鱼 +" .. result.income .. " 💰", 255, 220, 80)
+                end
+            end
+            if result and result.fuelAdded then
+                ShowNotify("加油 +" .. string.format("%.0f", result.fuelAdded) .. " ⛽", 255, 160, 60)
+            end
+        end
+        return
+    end
+
+    -- M 键: 航海图开关
+    if key == KEY_M then
+        mapOpen = not mapOpen
+        return
+    end
+
+    -- 航海图打开时拦截按键
+    if mapOpen then
+        if key == KEY_ESCAPE then
+            mapOpen = false
+        end
+        return
+    end
+
+    -- E 键: 岛屿停靠 (优先) 或拾取漂浮木板
+    if key == KEY_E and STATE == "sailing" then
+        local nearIsland = FindNearestIsland()
+        if nearIsland then
+            islandMenuOpen = true
+            dockedIsland = nearIsland
+            IslandMenu.Reset(nearIsland)
+            boat.speed = 0
+            boat.cruise = false
+            return
+        end
+
+        local idx = FindNearestPlank()
+        if idx then
+            local plank = floatingPlanks[idx]
+            local amount = plank.woodAmount
+            PlayerData.AddResource("wood", amount)
+            ShowNotify("拾取木料 +" .. amount, 210, 175, 110)
+            table.remove(floatingPlanks, idx)
+            table.insert(floatingPlanks, SpawnPlank(boat))
+        end
+    end
+
+    if key == KEY_SPACE then
+        HandleAction()
+    end
+
+    -- G 键: 开发者鱼种选择菜单
+    if key == KEY_G and STATE == "sailing" then
+        devFishSelect = not devFishSelect
+        if devFishSelect then
+            ShowNotify(string.format("[DEV] 选择鱼种 (1-%d) | G/ESC取消", #FISH_TYPES), 255, 150, 255)
+        end
+    end
+
+    -- 开发者鱼种选择: 数字键选鱼进入遛鱼
+    if devFishSelect and STATE == "sailing" then
+        local keyMap = { KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9 }
+        local fishIndex = nil
+        for i = 1, math.min(#FISH_TYPES, #keyMap) do
+            if key == keyMap[i] then fishIndex = i; break end
+        end
+        if fishIndex and fishIndex <= #FISH_TYPES then
+            devFishSelect = false
+            -- 确保有一根鱼竿在拖钓状态
+            local rod = rods[activeRod]
+            if rod.state == "idle" then
+                rod.state = "trolling"
+                rod.timer = 0
+                rod.biteAt = 999
+                InitRope(activeRod)
+            end
+            rod.state = "trolling"
+            local ft = FISH_TYPES[fishIndex]
+            local fish = {
+                type = ft,
+                weight = ft.wMin + math.random() * (ft.wMax - ft.wMin),
+            }
+            StartFight(fish)
+            ShowNotify("[DEV] 选择: " .. ft.name .. " (★" .. ft.diff .. ")", 255, 150, 255)
+            return  -- 阻止后续数字键处理
+        end
+    end
+
+    -- H 键: 实时波形图开关 (遛鱼中)
+    -- Tab 键: 展开/折叠遛鱼详情面板
+    if key == KEY_TAB and STATE == "fight" then
+        fightDetailOpen = not fightDetailOpen
+    end
+
+    if key == KEY_H and STATE == "fight" then
+        diagChartOn = not diagChartOn
+        if diagChartOn then
+            ShowNotify("[DIAG] 波形图 ON", 100, 255, 200)
+        else
+            ShowNotify("[DIAG] 波形图 OFF", 180, 180, 180)
+        end
+    end
+
+    -- L 键: 无限线长模式 (遛鱼中)
+    if key == KEY_L and STATE == "fight" then
+        diagInfiniteLine = not diagInfiniteLine
+        if diagInfiniteLine then
+            ShowNotify("[DIAG] 无限线长 ON - 不会清杯", 255, 220, 100)
+        else
+            ShowNotify("[DIAG] 无限线长 OFF", 180, 180, 180)
+        end
+    end
+
+    -- F 键切换巡航
+    if key == KEY_F and STATE == "sailing" then
+        boat.cruise = not boat.cruise
+        if boat.cruise then
+            ShowNotify("巡航开启 - 按S或再按F关闭", 100, 220, 255)
+        else
+            ShowNotify("巡航关闭", 180, 180, 180)
+        end
+    end
+
+    -- 数字键 1/2 切换鱼竿
+    if key == KEY_1 and STATE == "sailing" then
+        activeRod = 1
+        ShowNotify("切换到鱼竿 1", 200, 220, 255)
+    end
+    if key == KEY_2 and STATE == "sailing" then
+        activeRod = 2
+        ShowNotify("切换到鱼竿 2", 200, 220, 255)
+    end
+
+    if key == KEY_ESCAPE then
+        if devFishSelect then
+            devFishSelect = false
+        elseif STATE ~= "menu" then
+            STATE = "menu"
+        end
+    end
+end
+
+function HandleAction()
+    if STATE == "menu" then
+        -- 开始游戏
+        STATE = "sailing"
+        boat.x = 0
+        boat.y = 0
+        boat.angle = 0
+        boat.speed = 0
+        boat.cruise = false
+        camX = 0
+        camY = 0
+        caughtList = {}
+        totalWeight = 0
+        wakeParticles = {}
+        activeRod = 1
+        for i = 1, CFG.ROD_COUNT do
+            rods[i].state = "idle"
+            rods[i].timer = 0
+            rods[i].biteAt = 0
+            rods[i].biteTimer = 0
+            rods[i].rope = {}
+        end
+        InitLandmarks()
+        InitFishShadows()
+        ShowNotify("WASD开船 | F巡航 | 按住左键蓄力抛竿 | 1/2切竿", 200, 220, 255)
+
+    elseif STATE == "sailing" then
+        local rod = rods[activeRod]
+
+        if rod.state == "idle" then
+            -- 提示用鼠标蓄力抛竿
+            ShowNotify("按住左键蓄力, 瞄准方向松开抛竿!", 255, 220, 100)
+        elseif rod.state == "casting" then
+            -- 飞行中不做操作
+        elseif rod.state == "strike" then
+            -- 抬杆动画中不做操作
+        elseif rod.state == "trolling" then
+            -- 收线
+            rod.state = "idle"
+            rod.timer = 0
+            rod.rope = {}
+            ShowNotify("鱼竿" .. activeRod .. " 收线了", 200, 200, 200)
+        elseif rod.state == "bite" then
+            -- 有鱼咬钩, 直接进入遛鱼
+            rod.state = "trolling"  -- 保持线在水中
+            rod.timer = 0
+            local fish = PickRandomFish()
+            StartFight(fish)
+        end
+
+    elseif STATE == "fight" then
+        -- 遛鱼时空格/动作键=收线, 由 UpdateFight 持续检测
+        -- 此处不做额外处理
+
+    elseif STATE == "catch" or STATE == "fail" then
+        STATE = "sailing"
+    end
+end
+
+-- ============================================================================
+-- 渲染
+-- ============================================================================
+
+function HandleRender(eventType, eventData)
+    if not vg then return end
+
+    screenW = graphics:GetWidth()
+    screenH = graphics:GetHeight()
+
+    nvgBeginFrame(vg, screenW, screenH, 1.0)
+
+    -- ── 世界空间层 (统一缩放, 以屏幕中心为锚点) ──
+    nvgSave(vg)
+    nvgTranslate(vg, screenW / 2, screenH / 2)
+    nvgScale(vg, camScale, camScale)
+    nvgTranslate(vg, -screenW / 2, -screenH / 2)
+
+    -- 1. 水面
+    DrawWater()
+
+    -- 1.5 海浪精灵 (水面上层, 地标下层)
+    DrawWaveSprites()
+
+    -- 2. 世界物体 (尾流、鱼影、木板、停靠提示、上钩鱼影)
+    DrawWorldObjects()
+
+    -- 2.5 岛屿底层 (浅水光晕 + 浮沫 + 岛屿底图) → 在船之下
+    IslandSystem.DrawBelow(vg, WorldToScreen, screenW, screenH, gameTime)
+
+    -- 3. 船
+    DrawBoat()
+
+    -- 3.5 岛屿上层 (石头/宝箱/植物/建筑) → 在船之上
+    IslandSystem.DrawAbove(vg, WorldToScreen, screenW, screenH, gameTime)
+
+    -- 4. 钓鱼线 (每根活跃的鱼竿)
+    for i = 1, CFG.ROD_COUNT do
+        if rods[i].state ~= "idle" then
+            DrawFishingLine(i)
+        end
+    end
+
+    -- 5. 抬杆水花特效 (世界空间)
+    if strikeState.active then
+        DrawStrikeSplash()
+    end
+
+    -- 6. 蓄力抛竿方向指示 (世界空间)
+    if castState.charging and STATE == "sailing" then
+        DrawCastAim()
+    end
+
+    nvgRestore(vg)
+    -- ── 屏幕空间层 (不缩放, UI/HUD/菜单) ──
+
+    -- 5. UI 层
+    if STATE == "menu" then
+        DrawMenu()
+    elseif STATE == "fight" then
+        DrawFight()
+    elseif STATE == "catch" then
+        DrawCatchResult()
+    elseif STATE == "fail" then
+        DrawFailResult()
+    end
+
+    -- 6. HUD
+    if STATE ~= "menu" then
+        DrawHUD()
+    end
+
+    -- 6b. 蓄力力度条 (屏幕空间)
+    if castState.charging and STATE == "sailing" then
+        DrawCastPowerBar()
+    end
+
+    -- 7. 开发者鱼种选择菜单
+    DrawDevFishSelect()
+
+    -- 8. 通知
+    DrawNotification()
+
+    -- 9. 虚拟控件
+    if STATE == "sailing" then
+        DrawVirtualControls()
+    end
+
+    -- 10. 海域分区切换通知
+    if zoneNotify.timer > 0 and zoneNotify.alpha > 0 then
+        nvgSave(vg)
+        local a = zoneNotify.alpha
+        -- 进入动画：从上方滑入
+        local slideIn = math.min(1.0, (3.0 - zoneNotify.timer) * 4)  -- 0.25s 滑入
+        local yOff = (1 - slideIn) * (-30)
+        local cy = screenH * 0.22 + yOff
+
+        -- 背景条
+        nvgBeginPath(vg)
+        local barW = 200
+        nvgRoundedRect(vg, (screenW - barW) * 0.5, cy - 16, barW, 32, 4)
+        nvgFillColor(vg, nvgRGBA(0, 0, 0, math.floor(a * 0.4)))
+        nvgFill(vg)
+
+        -- 区域名称
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 18)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(220, 235, 255, a))
+        nvgText(vg, screenW * 0.5, cy, zoneNotify.text, nil)
+        nvgRestore(vg)
+    end
+
+    -- 11. 航海图（最顶层覆盖）
+    DrawMap()
+
+    nvgEndFrame(vg)
+end
+
+-- ============================================================================
+-- 水面渲染 (2D Water Shader)
+-- ============================================================================
+
+function DrawWater()
+    local w, h = screenW, screenH
+    local t = waterTime
+
+    -- 1) 基础海色（随海域分区变化，平滑过渡）
+    local fromZone = ZONE_TABLE[currentZoneR] or ZONE_TABLE[190]
+    local toZone   = ZONE_TABLE[targetZoneR]  or ZONE_TABLE[190]
+    local t_z = zoneColorT
+    local function lerpC(a, b, f) return math.floor(a + (b - a) * f + 0.5) end
+    local c1r = lerpC(fromZone[1][1], toZone[1][1], t_z)
+    local c1g = lerpC(fromZone[1][2], toZone[1][2], t_z)
+    local c1b = lerpC(fromZone[1][3], toZone[1][3], t_z)
+    local c2r = lerpC(fromZone[2][1], toZone[2][1], t_z)
+    local c2g = lerpC(fromZone[2][2], toZone[2][2], t_z)
+    local c2b = lerpC(fromZone[2][3], toZone[2][3], t_z)
+
+    nvgBeginPath(vg)
+    nvgRect(vg, 0, 0, w, h)
+    local baseGrad = nvgLinearGradient(vg, 0, 0, w * 0.3, h,
+        nvgRGBA(c1r, c1g, c1b, 255),
+        nvgRGBA(c2r, c2g, c2b, 255))
+    nvgFillPaint(vg, baseGrad)
+    nvgFill(vg)
+
+    -- 2) 大波浪色带 (模拟水面光照变化, 世界坐标)
+    for i = 1, 5 do
+        local phase = t * (0.3 + i * 0.08) + i * 1.7
+        local yOff = math.sin(phase) * 40
+        local worldBaseY = i * 120 + yOff
+        local bandY = ((worldBaseY - camY * 0.6) % (h + 120)) - 60
+        local bandH = 60 + math.sin(t * 0.5 + i) * 20
+
+        local alpha = 18 + math.sin(t * 0.4 + i * 2) * 8
+        local grad = nvgLinearGradient(vg, 0, bandY - bandH/2, 0, bandY + bandH/2,
+            nvgRGBA(40, 100, 170, 0),
+            nvgRGBA(30, 85, 155, alpha))
+        nvgBeginPath(vg)
+        nvgRect(vg, 0, bandY - bandH/2, w, bandH)
+        nvgFillPaint(vg, grad)
+        nvgFill(vg)
+
+        local grad2 = nvgLinearGradient(vg, 0, bandY - bandH/2, 0, bandY + bandH/2,
+            nvgRGBA(30, 85, 155, alpha),
+            nvgRGBA(40, 100, 170, 0))
+        nvgBeginPath(vg)
+        nvgRect(vg, 0, bandY, w, bandH)
+        nvgFillPaint(vg, grad2)
+        nvgFill(vg)
+    end
+
+    -- 3) 波纹线条 (sin 曲线模拟水波, 视差滚动)
+    local waveCount = 10
+    local waveSpacing = (h + 40) / waveCount
+    local waveScroll = (camY * 0.7) % waveSpacing
+    local waveCamX = camX * 0.7
+
+    for i = 0, waveCount - 1 do
+        local baseY = i * waveSpacing - waveScroll
+        local seed = i + 1
+        local waveFreq = 0.008 + seed * 0.002
+        local waveAmp = 4 + seed * 0.8
+        local waveSpeed = t * (0.6 + seed * 0.12) + seed * 0.9
+
+        nvgBeginPath(vg)
+        local startY = baseY + math.sin(waveSpeed) * waveAmp
+        nvgMoveTo(vg, 0, startY)
+        for x = 10, w, 10 do
+            local yy = baseY + math.sin((x + waveCamX) * waveFreq + waveSpeed) * waveAmp
+            nvgLineTo(vg, x, yy)
+        end
+        local lineAlpha = 15 + seed * 3
+        nvgStrokeColor(vg, nvgRGBA(70, 140, 210, lineAlpha))
+        nvgStrokeWidth(vg, 1.2)
+        nvgStroke(vg)
+    end
+
+    -- 4) 焦散光斑 (Caustics)
+    for i = 1, 35 do
+        local phase = waterTime * 1.8 + i * 5.37
+        local lifePhase = math.sin(phase)
+        if lifePhase > 0 then
+            local wx = i * 173 + math.sin(waterTime * 0.25 + i * 0.7) * 30
+            local wy = i * 119 + math.cos(waterTime * 0.3 + i * 0.9) * 25
+            local cx = ((wx - camX * 0.8) % (w + 40)) - 20
+            local cy = ((wy - camY * 0.8) % (h + 40)) - 20
+            local sz = 2 + lifePhase * 3
+            local alpha = lifePhase * 60
+
+            nvgBeginPath(vg)
+            nvgCircle(vg, cx, cy, sz)
+            nvgFillColor(vg, nvgRGBA(150, 210, 255, alpha))
+            nvgFill(vg)
+        end
+    end
+
+    -- 5) 太阳反光斑 (Specular highlights)
+    for i = 1, 8 do
+        local phase = waterTime * 0.7 + i * 3.14
+        local blink = math.max(0, math.sin(phase))
+        if blink > 0.3 then
+            local wx = i * 211 + math.sin(waterTime * 0.15 + i) * 50
+            local wy = i * 157 + math.cos(waterTime * 0.2 + i) * 40
+            local ssx = ((wx - camX * 0.7) % (w + 60)) - 30
+            local ssy = ((wy - camY * 0.7) % (h + 60)) - 30
+            local sz = 1.5 + blink * 2
+
+            local glow = nvgRadialGradient(vg, ssx, ssy, 0, sz * 3,
+                nvgRGBA(255, 255, 220, blink * 120),
+                nvgRGBA(255, 255, 220, 0))
+            nvgBeginPath(vg)
+            nvgCircle(vg, ssx, ssy, sz * 3)
+            nvgFillPaint(vg, glow)
+            nvgFill(vg)
+        end
+    end
+
+    -- (浅水光晕已移至 IslandSystem.DrawBelow)
+end
+
+-- ============================================================================
+-- 世界物体渲染
+-- ============================================================================
+
+function WorldToScreen(wx, wy)
+    return screenW / 2 + (wx - camX),
+           screenH / 2 + (wy - camY)
+end
+
+function ScreenToWorld(sx, sy)
+    return camX + (sx - screenW / 2) / camScale,
+           camY + (sy - screenH / 2) / camScale
+end
+
+function DrawWorldObjects()
+    -- 尾流
+    for _, p in ipairs(wakeParticles) do
+        local sx, sy = WorldToScreen(p.x, p.y)
+        if sx > -50 and sx < screenW + 50 and sy > -50 and sy < screenH + 50 then
+            local alpha = (p.life / p.maxLife) * 100
+            nvgBeginPath(vg)
+            nvgCircle(vg, sx, sy, p.size)
+            nvgFillColor(vg, nvgRGBA(180, 220, 255, alpha))
+            nvgFill(vg)
+        end
+    end
+
+    -- 鱼影
+    for _, fs in ipairs(fishShadows) do
+        local sx, sy = WorldToScreen(fs.x, fs.y)
+        if sx > -50 and sx < screenW + 50 and sy > -50 and sy < screenH + 50 then
+            nvgSave(vg)
+            nvgTranslate(vg, sx, sy)
+            nvgRotate(vg, fs.angle)
+
+            local wobble = math.sin(fs.wobble) * 0.15
+            local fishLen = fs.size
+            local fishW = fs.size * 0.35
+
+            -- 鱼身 (半透明暗色)
+            local alpha = fs.attracted and 60 or 35
+            nvgBeginPath(vg)
+            nvgEllipse(vg, 0, 0, fishLen, fishW)
+            nvgFillColor(vg, nvgRGBA(20, 40, 60, alpha))
+            nvgFill(vg)
+
+            -- 鱼尾
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, -fishLen, 0)
+            nvgLineTo(vg, -fishLen - fishW + wobble * fishW, -fishW * 0.6)
+            nvgLineTo(vg, -fishLen - fishW + wobble * fishW, fishW * 0.6)
+            nvgClosePath(vg)
+            nvgFillColor(vg, nvgRGBA(20, 40, 60, alpha))
+            nvgFill(vg)
+
+            nvgRestore(vg)
+        end
+    end
+
+    -- 漂浮木板
+    for idx, p in ipairs(floatingPlanks) do
+        local sx, sy = WorldToScreen(p.x, p.y)
+        if sx > -60 and sx < screenW + 60 and sy > -60 and sy < screenH + 60 then
+            nvgSave(vg)
+            nvgTranslate(vg, sx, sy)
+            nvgRotate(vg, p.angle)
+
+            local halfL = p.length / 2
+            local halfW = p.width / 2
+            local wobble = math.sin(p.wobbleT * 1.2) * 1.5  -- 水波颠簸
+
+            -- 木板阴影（水下）
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, -halfL + 1, -halfW + 1 + wobble, p.length, p.width, 2)
+            nvgFillColor(vg, nvgRGBA(15, 30, 50, 50))
+            nvgFill(vg)
+
+            -- 木板本体
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, -halfL, -halfW + wobble, p.length, p.width, 2)
+            nvgFillColor(vg, nvgRGBA(160, 120, 65, 210))
+            nvgFill(vg)
+
+            -- 木纹线
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, -halfL + 3, wobble)
+            nvgLineTo(vg, halfL - 3, wobble)
+            nvgStrokeColor(vg, nvgRGBA(130, 95, 45, 100))
+            nvgStrokeWidth(vg, 0.8)
+            nvgStroke(vg)
+
+            -- 靠近时显示拾取提示光圈
+            local dx = p.x - boat.x
+            local dy = p.y - boat.y
+            local dist = math.sqrt(dx * dx + dy * dy)
+            if dist < PLANK_PICKUP_DIST then
+                nvgBeginPath(vg)
+                local pulseR = (halfL + 6) + math.sin(p.wobbleT * 3) * 2
+                nvgCircle(vg, 0, wobble, pulseR)
+                nvgStrokeColor(vg, nvgRGBA(255, 230, 130, 140))
+                nvgStrokeWidth(vg, 1.5)
+                nvgStroke(vg)
+            end
+
+            nvgRestore(vg)
+
+            -- 拾取提示文字（光圈外面画，不受旋转影响）
+            if dist < PLANK_PICKUP_DIST then
+                nvgFontFace(vg, "sans")
+                nvgFontSize(vg, 12)
+                nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+                nvgFillColor(vg, nvgRGBA(255, 240, 180, 220))
+                nvgText(vg, sx, sy - 18, "[E] 拾取", nil)
+            end
+        end
+    end
+
+    -- 岛屿停靠提示 [E]
+    if not islandMenuOpen and STATE == "sailing" then
+        local nearIsland = FindNearestIsland()
+        if nearIsland then
+            local isx, isy = WorldToScreen(nearIsland.x, nearIsland.y)
+            -- 脉冲动画
+            local pulse = 0.7 + 0.3 * math.sin(gameTime * 3)
+            nvgFontFace(vg, "sans")
+            nvgFontSize(vg, 16)
+            nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+            nvgFillColor(vg, nvgRGBA(255, 240, 180, math.floor(220 * pulse)))
+            nvgText(vg, isx, isy - 40, "[E] 停靠", nil)
+        end
+    end
+
+    -- 遛鱼中的上钩鱼影 (动森风格水滴形, 圆头尖尾, 朝向运动方向)
+    if STATE == "fight" and curFish and fight.fishWorldX then
+        local fsx, fsy = WorldToScreen(fight.fishWorldX, fight.fishWorldY)
+        if fsx > -200 and fsx < screenW + 200 and fsy > -200 and fsy < screenH + 200 then
+            -- 鱼影大小: 根据鱼重量缩放, 0.5kg→18px, 50kg→65px
+            local wt = curFish.weight or 1
+            local shadowLen = 18 + math.min(47, wt * 1.5) -- 半长(像素)
+            local headR = shadowLen * 0.32  -- 头部圆半径
+            local hcx = shadowLen * 0.35    -- 头部圆心偏前
+
+            -- 摆尾动画: 频率随体力变化, 疲惫时慢
+            local staminaRatio = fight.fishStamina / fight.fishMaxStam
+            local wobbleFreq = 4.0 + staminaRatio * 6.0
+            local wobbleAmp = 0.12 + staminaRatio * 0.08
+            local wobble = math.sin(gameTime * wobbleFreq) * wobbleAmp
+
+            nvgSave(vg)
+            nvgTranslate(vg, fsx, fsy)
+            -- heading 角: 0=上(-Y), π/2=右(+X); 鱼身沿+X绘制, 需减 π/2 对齐
+            nvgRotate(vg, fight.fishHeading - math.pi * 0.5 + wobble)
+
+            -- 鱼身: 水滴形 (前端半圆 + 两侧收束到尖尾)
+            nvgBeginPath(vg)
+            nvgArc(vg, hcx, 0, headR, -math.pi * 0.5, math.pi * 0.5, NVG_CW)
+            -- 下侧曲线 → 尖尾
+            nvgQuadTo(vg, -shadowLen * 0.3, headR * 0.35, -shadowLen, 0)
+            -- 上侧曲线 ← 尖尾
+            nvgQuadTo(vg, -shadowLen * 0.3, -headR * 0.35, hcx, -headR)
+            nvgClosePath(vg)
+            nvgFillColor(vg, nvgRGBA(15, 30, 50, 90))
+            nvgFill(vg)
+
+            -- 尾鳍: V 形, 带摆动
+            local tailWob = math.sin(gameTime * wobbleFreq + 1.0) * headR * 0.35
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, -shadowLen, 0)
+            nvgLineTo(vg, -shadowLen - headR * 0.7 + tailWob, -headR * 0.55)
+            nvgLineTo(vg, -shadowLen - headR * 0.7 + tailWob,  headR * 0.55)
+            nvgClosePath(vg)
+            nvgFillColor(vg, nvgRGBA(15, 30, 50, 75))
+            nvgFill(vg)
+
+            nvgRestore(vg)
+        end
+    end
+
+    -- (旧地标岛屿贴图/浮沫/装饰物渲染已移至 IslandSystem.DrawBelow / DrawAbove)
+end
+
+-- ============================================================================
+-- 小船渲染 (Sprite Stacking 伪 3D)
+-- ============================================================================
+
+-- 层间垂直偏移 (像素), 控制立体感强度
+local STACK_OFFSET = CFG.STACK_OFFSET
+
+-- 绘制船体截面轮廓的通用函数 (贝塞尔船形)
+-- wScale: 宽度缩放, lScale: 长度缩放, sternScale: 船尾宽度比
+local function DrawHullPath(L, W, wScale, lScale, sternScale)
+    local w = W * wScale
+    local l = L * lScale
+    local stern = sternScale or 0.85
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -l)                                                        -- 船头尖端
+    nvgBezierTo(vg, w * 0.6, -l * 0.3, w * 0.55, l * 0.15, w * 0.45, l * 0.5) -- 右弧
+    nvgLineTo(vg, w * 0.4 * stern, l * 0.65)                                    -- 右船尾
+    nvgLineTo(vg, -w * 0.4 * stern, l * 0.65)                                   -- 左船尾
+    nvgLineTo(vg, -w * 0.45, l * 0.5)                                           -- 左舷
+    nvgBezierTo(vg, -w * 0.55, l * 0.15, -w * 0.6, -l * 0.3, 0, -l)           -- 左弧
+    nvgClosePath(vg)
+end
+
+function DrawBoat()
+    local sx, sy = WorldToScreen(boat.x, boat.y)
+    local L = CFG.BOAT_LENGTH
+    local W = CFG.BOAT_WIDTH
+
+    -- ── 层 0: 水面阴影 (不参与堆叠, 固定在水面) ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx + 3, sy + 3)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 1.05, 1.0)
+    nvgFillColor(vg, nvgRGBA(0, 15, 40, 50))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 1: 龙骨 (水下最底层, 窄而长) ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 1)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 0.45, 0.88, 0.6)
+    nvgFillColor(vg, nvgRGBA(60, 35, 15, 255))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 2: 下船体 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 2)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 0.62, 0.92, 0.7)
+    nvgFillColor(vg, nvgRGBA(80, 48, 20, 255))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 3: 中船体 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 3)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 0.78, 0.95, 0.8)
+    nvgFillColor(vg, nvgRGBA(105, 65, 28, 255))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 4: 上船体 (水线面, 最宽) ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 4)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 0.92, 0.98, 0.88)
+    nvgFillColor(vg, nvgRGBA(130, 82, 35, 255))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 5: 船舷 (带深色描边的外壳顶部) ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 5)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 1.0, 1.0, 0.92)
+    nvgFillColor(vg, nvgRGBA(155, 105, 50, 255))
+    nvgFill(vg)
+    -- 船舷边线
+    DrawHullPath(L, W, 1.0, 1.0, 0.92)
+    nvgStrokeColor(vg, nvgRGBA(90, 55, 22, 220))
+    nvgStrokeWidth(vg, 1.2)
+    nvgStroke(vg)
+    nvgRestore(vg)
+
+    -- ── 层 6: 甲板 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 6)
+    nvgRotate(vg, boat.angle)
+    DrawHullPath(L, W, 0.88, 0.93, 0.85)
+    nvgFillColor(vg, nvgRGBA(195, 165, 115, 255))
+    nvgFill(vg)
+    -- 甲板木纹线
+    for i = 1, 4 do
+        local lx = -W * 0.3 + (i / 5) * W * 0.6
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, lx, -L * 0.7)
+        nvgLineTo(vg, lx, L * 0.5)
+        nvgStrokeColor(vg, nvgRGBA(170, 140, 90, 80))
+        nvgStrokeWidth(vg, 0.6)
+        nvgStroke(vg)
+    end
+    -- 船头设备 (绞盘)
+    nvgBeginPath(vg)
+    nvgCircle(vg, 0, -L * 0.65, 2.5)
+    nvgFillColor(vg, nvgRGBA(120, 120, 130, 220))
+    nvgFill(vg)
+    -- 船尾鱼竿座 (金属底座)
+    local baseX, baseY = GetRodBaseLocal()
+    for i = 1, 2 do
+        local side = (i == 1) and -1 or 1
+        nvgBeginPath(vg)
+        nvgCircle(vg, baseX * side, baseY, 2.5)
+        nvgFillColor(vg, nvgRGBA(90, 90, 100, 220))
+        nvgFill(vg)
+        nvgStrokeColor(vg, nvgRGBA(60, 60, 70, 180))
+        nvgStrokeWidth(vg, 0.8)
+        nvgStroke(vg)
+    end
+    nvgRestore(vg)
+
+    -- ── 层 6.5: 鱼竿 (甲板与舱室之间) ──
+    local tipX, tipY = GetRodTipLocal()
+    for i = 1, 2 do
+        local side = rods[i].side
+
+        -- 抬杆偏移: 快速上升 → 缓慢回落 (ease-out)
+        local strikeLift = 0
+        if strikeState.active and strikeState.rodIndex == i then
+            local t = strikeState.timer / CFG.STRIKE_DURATION  -- 0→1
+            if t < 0.3 then
+                strikeLift = (t / 0.3)
+            else
+                strikeLift = 1.0 - ((t - 0.3) / 0.7)
+            end
+            strikeLift = strikeLift * CFG.STRIKE_LIFT_PX
+        end
+
+        nvgSave(vg)
+        nvgTranslate(vg, sx, sy - STACK_OFFSET * 6.5 - strikeLift)
+        nvgRotate(vg, boat.angle)
+
+        local bx = baseX * side
+        local by = baseY
+        local tx = tipX * side
+        local ty = tipY
+
+        -- ── 鱼竿弯曲: 根据鱼线张力 + 方向，累积角度旋转 ──
+        local ROD_SECTIONS = 5
+        local pts = {}
+        for s = 0, ROD_SECTIONS do
+            local t = s / ROD_SECTIONS
+            pts[s + 1] = {
+                x = bx + (tx - bx) * t,
+                y = by + (ty - by) * t,
+            }
+        end
+
+        local rod_i = rods[i]
+        local bendFactor = 0
+        local localPullX, localPullY = 0, 0
+
+        if rod_i.rope and #rod_i.rope >= 2 and rod_i.state ~= "idle" then
+            local straightTipX, straightTipY = GetRodTipLocal()
+            straightTipX = straightTipX * rod_i.side
+            local cosB = math.cos(boat.angle)
+            local sinB = math.sin(boat.angle)
+            local sax = boat.x + straightTipX * cosB - straightTipY * sinB
+            local say = boat.y + straightTipX * sinB + straightTipY * cosB
+
+            -- fight 状态用鱼的世界坐标做拉力参考，避免 rope 节点被旋转反馈污染
+            local pullRefX, pullRefY
+            if STATE == "fight" and activeRod == i then
+                pullRefX, pullRefY = GetFishWorldPos()
+            else
+                local r2 = rod_i.rope[math.min(3, #rod_i.rope)]
+                pullRefX, pullRefY = r2.x, r2.y
+            end
+            local dx, dy = pullRefX - sax, pullRefY - say
+            local dlen = math.sqrt(dx * dx + dy * dy)
+            if dlen > 0.1 then
+                local wPullX, wPullY = dx / dlen, dy / dlen
+                local cosA = math.cos(-boat.angle)
+                local sinA = math.sin(-boat.angle)
+                localPullX = wPullX * cosA - wPullY * sinA
+                localPullY = wPullX * sinA + wPullY * cosA
+            end
+
+            if STATE == "fight" and activeRod == i then
+                bendFactor = math.min(1.0, (fight.tension or 0) / CFG.FIGHT_LINE_STRENGTH)
+            elseif rod_i.state == "bite" then
+                bendFactor = 0.25
+            elseif rod_i.state == "trolling" then
+                bendFactor = 0.08
+            end
+        end
+
+        -- ── 鱼竿跟随方向旋转 (读取 UpdateRodAim 计算的 aimAngle) ──
+        local rotAngle = rod_i.aimAngle
+
+        if math.abs(rotAngle) > 0.001 then
+            local cosF = math.cos(rotAngle)
+            local sinF = math.sin(rotAngle)
+            for j = 2, ROD_SECTIONS + 1 do
+                local ox = pts[j].x - pts[1].x
+                local oy = pts[j].y - pts[1].y
+                pts[j].x = pts[1].x + ox * cosF - oy * sinF
+                pts[j].y = pts[1].y + ox * sinF + oy * cosF
+            end
+            tx = pts[ROD_SECTIONS + 1].x
+            ty = pts[ROD_SECTIONS + 1].y
+        end
+
+        if false and bendFactor > 0.005 then  -- 暂时关闭弯曲, 只保留抬杆+转动
+            local rodDX = tx - bx
+            local rodDY = ty - by
+            local rodLen = math.sqrt(rodDX * rodDX + rodDY * rodDY)
+            if rodLen > 0.1 then
+                local rodNX, rodNY = rodDX / rodLen, rodDY / rodLen
+                local perpSign = rodNX * localPullY - rodNY * localPullX
+
+                -- 计算拉力方向与鱼竿方向的夹角, 限制竿尖弯曲不超过此角度
+                local pullLen = math.sqrt(localPullX * localPullX + localPullY * localPullY)
+                local maxAngle = math.pi * 0.45  -- 默认上限 81°
+                if pullLen > 0.01 then
+                    local dot = rodNX * (localPullX / pullLen) + rodNY * (localPullY / pullLen)
+                    dot = math.max(-1, math.min(1, dot))
+                    local angleBetween = math.acos(dot)  -- 拉力与鱼竿的夹角
+                    maxAngle = math.min(maxAngle, angleBetween * 0.85)  -- 弯到夹角的 85%, 不超过
+                end
+
+                local jointFlex = { 0.025, 0.05, 0.10, 0.18, 0.30 }
+                local BEND_SCALE = 5.0
+                local flexSum = 0.555  -- jointFlex 总和
+                local rawTotal = math.abs(perpSign) * bendFactor * flexSum * BEND_SCALE
+                -- 如果原始总角度超过 maxAngle, 等比缩放
+                local scale = 1.0
+                if rawTotal > maxAngle and rawTotal > 0.001 then
+                    scale = maxAngle / rawTotal
+                end
+
+                for j = 1, ROD_SECTIONS do
+                    local angle = perpSign * bendFactor * jointFlex[j] * BEND_SCALE * scale
+                    local pivX, pivY = pts[j].x, pts[j].y
+                    local cosR = math.cos(angle)
+                    local sinR = math.sin(angle)
+                    for k = j + 1, ROD_SECTIONS + 1 do
+                        local ox = pts[k].x - pivX
+                        local oy = pts[k].y - pivY
+                        pts[k].x = pivX + ox * cosR - oy * sinR
+                        pts[k].y = pivY + ox * sinR + oy * cosR
+                    end
+                end
+            end
+        end
+
+        -- ── 伪透视压缩: 抬杆时竿身均匀收缩 (模拟俯视投影) ──
+        local liftT_now = 0
+        if STATE == "fight" and activeRod == i and fight.liftT > 0.001 then
+            liftT_now = fight.liftT
+            local liftAngle = liftT_now * CFG.FIGHT_LIFT_MAX_ANGLE
+            local cosLift = math.cos(liftAngle)  -- 投影缩放 = cos(抬起角)
+            -- 均匀缩放: 每个点到竿根的距离等比缩短, 角度不变
+            -- 物理正确: 绕竿根向上旋转的俯视投影 = 所有水平分量 × cos(θ)
+            for j = 2, ROD_SECTIONS + 1 do
+                local dx = pts[j].x - pts[1].x
+                local dy = pts[j].y - pts[1].y
+                pts[j].x = pts[1].x + dx * cosLift
+                pts[j].y = pts[1].y + dy * cosLift
+            end
+        end
+
+        -- 缓存弯曲+压缩后竿尖的屏幕坐标 (直接复用当前 NanoVG 变换)
+        -- 当前变换: translate(sx, sy - stackOff - strikeLift) + rotate(boat.angle)
+        -- 所以本地点 (lx, ly) 对应屏幕: (sx + lx*cos - ly*sin, sy - stackOff - strikeLift + lx*sin + ly*cos)
+        do
+            local lx = pts[ROD_SECTIONS + 1].x
+            local ly = pts[ROD_SECTIONS + 1].y
+            local cosB = math.cos(boat.angle)
+            local sinB = math.sin(boat.angle)
+            rodBentTips[i] = {
+                sx = sx + lx * cosB - ly * sinB,
+                sy = sy - STACK_OFFSET * 6.5 - strikeLift + lx * sinB + ly * cosB,
+            }
+        end
+
+        -- ── 5节竿身绘制 ──
+        local secWidths  = { 3.6, 2.8, 2.0, 1.4, 0.8 }
+        -- 抬杆时竿尖段变粗 (透视近大远小: 竿尖离"镜头"更近)
+        if liftT_now > 0.001 then
+            for s = 1, ROD_SECTIONS do
+                -- 从根→尖, 缩放递增: 根节不变, 尖节最大放大1.5倍
+                local frac = (s - 1) / (ROD_SECTIONS - 1)  -- 0, 0.25, 0.5, 0.75, 1.0
+                secWidths[s] = secWidths[s] * (1.0 + liftT_now * frac * 0.5)
+            end
+        end
+        local secColors  = {
+            { 45, 40, 35 },
+            { 55, 50, 50 },
+            { 70, 65, 65 },
+            { 90, 88, 85 },
+            { 115, 115, 120 },
+        }
+        for s = 1, ROD_SECTIONS do
+            local p0 = pts[s]
+            local p1 = pts[s + 1]
+            local c = secColors[s]
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, p0.x, p0.y)
+            nvgLineTo(vg, p1.x, p1.y)
+            nvgStrokeColor(vg, nvgRGBA(c[1], c[2], c[3], 240))
+            nvgStrokeWidth(vg, secWidths[s])
+            nvgStroke(vg)
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, p0.x, p0.y)
+            nvgLineTo(vg, p1.x, p1.y)
+            nvgStrokeColor(vg, nvgRGBA(180, 180, 190, 60 + s * 10))
+            nvgStrokeWidth(vg, secWidths[s] * 0.3)
+            nvgStroke(vg)
+            if s < ROD_SECTIONS then
+                nvgBeginPath(vg)
+                nvgCircle(vg, p1.x, p1.y, secWidths[s] * 0.55)
+                nvgFillColor(vg, nvgRGBA(100, 95, 90, 200))
+                nvgFill(vg)
+            end
+        end
+        -- 竿尖导环
+        local tipPt = pts[ROD_SECTIONS + 1]
+        nvgBeginPath(vg)
+        nvgCircle(vg, tipPt.x, tipPt.y, 1.2)
+        nvgFillColor(vg, nvgRGBA(200, 200, 210, 230))
+        nvgFill(vg)
+        -- 竿根握把
+        nvgBeginPath(vg)
+        nvgCircle(vg, bx, by, 2.5)
+        nvgFillColor(vg, nvgRGBA(60, 55, 50, 220))
+        nvgFill(vg)
+
+        nvgRestore(vg)
+    end
+
+    -- ── 层 7: 舱室底部 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 7)
+    nvgRotate(vg, boat.angle)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, -W * 0.3, -L * 0.25, W * 0.6, L * 0.48, 3)
+    nvgFillColor(vg, nvgRGBA(210, 190, 160, 255))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 8: 舱室中部 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 8)
+    nvgRotate(vg, boat.angle)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, -W * 0.28, -L * 0.22, W * 0.56, L * 0.44, 3)
+    nvgFillColor(vg, nvgRGBA(220, 200, 172, 255))
+    nvgFill(vg)
+    -- 侧面窗户
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, -W * 0.27, -L * 0.1, W * 0.12, L * 0.12, 1.5)
+    nvgFillColor(vg, nvgRGBA(140, 195, 230, 200))
+    nvgFill(vg)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, W * 0.15, -L * 0.1, W * 0.12, L * 0.12, 1.5)
+    nvgFillColor(vg, nvgRGBA(140, 195, 230, 200))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 层 9: 舱室上部 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 9)
+    nvgRotate(vg, boat.angle)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, -W * 0.26, -L * 0.20, W * 0.52, L * 0.40, 3)
+    nvgFillColor(vg, nvgRGBA(230, 212, 185, 255))
+    nvgFill(vg)
+    -- 前窗 (大窗)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, -W * 0.18, -L * 0.18, W * 0.36, L * 0.1, 2)
+    nvgFillColor(vg, nvgRGBA(120, 185, 225, 220))
+    nvgFill(vg)
+    -- 窗框
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -L * 0.18)
+    nvgLineTo(vg, 0, -L * 0.08)
+    nvgStrokeColor(vg, nvgRGBA(180, 160, 130, 180))
+    nvgStrokeWidth(vg, 0.8)
+    nvgStroke(vg)
+    nvgRestore(vg)
+
+    -- ── 层 10: 舱顶 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 10)
+    nvgRotate(vg, boat.angle)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, -W * 0.24, -L * 0.18, W * 0.48, L * 0.36, 4)
+    nvgFillColor(vg, nvgRGBA(200, 185, 160, 255))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(160, 140, 110, 180))
+    nvgStrokeWidth(vg, 0.8)
+    nvgStroke(vg)
+    nvgRestore(vg)
+
+    -- ── 层 11: 天线/桅杆 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 11)
+    nvgRotate(vg, boat.angle)
+    -- 桅杆
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -L * 0.05)
+    nvgLineTo(vg, 0, -L * 0.35)
+    nvgStrokeColor(vg, nvgRGBA(160, 140, 100, 240))
+    nvgStrokeWidth(vg, 1.8)
+    nvgStroke(vg)
+    nvgRestore(vg)
+
+    -- ── 层 12: 桅杆顶部 + 旗帜 ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 12)
+    nvgRotate(vg, boat.angle)
+    -- 横杆
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, -W * 0.2, -L * 0.28)
+    nvgLineTo(vg, W * 0.2, -L * 0.28)
+    nvgStrokeColor(vg, nvgRGBA(150, 130, 90, 220))
+    nvgStrokeWidth(vg, 1.2)
+    nvgStroke(vg)
+    -- 旗子
+    local flagWave = math.sin(gameTime * 4) * 2
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -L * 0.35)
+    nvgLineTo(vg, 8 + flagWave, -L * 0.32)
+    nvgLineTo(vg, 0, -L * 0.28)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(220, 55, 40, 230))
+    nvgFill(vg)
+    nvgRestore(vg)
+
+    -- ── 方向指示 (最顶层, 不参与堆叠深度) ──
+    nvgSave(vg)
+    nvgTranslate(vg, sx, sy - STACK_OFFSET * 13)
+    nvgRotate(vg, boat.angle)
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -L - 4)
+    nvgLineTo(vg, 3.5, -L + 2)
+    nvgLineTo(vg, -3.5, -L + 2)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 130))
+    nvgFill(vg)
+    nvgRestore(vg)
+end
+
+-- ============================================================================
+-- 钓鱼线渲染
+-- ============================================================================
+
+-- ── 蓄力抛竿: 方向指示线 + 落点标记 (世界空间层, canvas zoom 内) ──
+-- ── 抬杆水花特效 ──
+function DrawStrikeSplash()
+    local sx, sy = WorldToScreen(strikeState.splashX, strikeState.splashY)
+    local t = strikeState.timer / CFG.STRIKE_DURATION  -- 0→1
+
+    -- 水花: 从中心爆发的径向线条 + 水滴圆点
+    local alpha = math.floor(255 * math.max(0, 1.0 - t * 1.5))  -- 快速淡出
+    if alpha <= 0 then return end
+
+    local numRays = 8
+    for i = 1, numRays do
+        local angle = (i / numRays) * math.pi * 2 + t * 2  -- 微旋转
+        local innerR = 4 + t * 15
+        local outerR = 10 + t * 35
+        local ix = sx + math.cos(angle) * innerR
+        local iy = sy + math.sin(angle) * innerR
+        local ox = sx + math.cos(angle) * outerR
+        local oy = sy + math.sin(angle) * outerR
+
+        -- 水花线
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, ix, iy)
+        nvgLineTo(vg, ox, oy)
+        nvgStrokeWidth(vg, 2.0 * (1.0 - t))
+        nvgStrokeColor(vg, nvgRGBA(200, 230, 255, alpha))
+        nvgStroke(vg)
+
+        -- 水滴点
+        nvgBeginPath(vg)
+        nvgCircle(vg, ox, oy, 1.5 * (1.0 - t * 0.7))
+        nvgFillColor(vg, nvgRGBA(220, 240, 255, alpha))
+        nvgFill(vg)
+    end
+
+    -- 中心白色闪光 (极短)
+    if t < 0.15 then
+        local flashA = math.floor(200 * (1.0 - t / 0.15))
+        local flashR = 8 + t * 40
+        local glow = nvgRadialGradient(vg, sx, sy, 0, flashR,
+            nvgRGBA(255, 255, 255, flashA),
+            nvgRGBA(255, 255, 255, 0))
+        nvgBeginPath(vg)
+        nvgCircle(vg, sx, sy, flashR)
+        nvgFillPaint(vg, glow)
+        nvgFill(vg)
+    end
+end
+
+function DrawCastAim()
+    -- 使用旋转后的竿尖位置 (由 UpdateRodAim 驱动)
+    local ax, ay = GetRotatedTipWorld(activeRod)
+    local mx = input:GetMousePosition().x
+    local my = input:GetMousePosition().y
+    local mwx, mwy = ScreenToWorld(mx, my)
+
+    -- 方向向量
+    local dx = mwx - ax
+    local dy = mwy - ay
+    local dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 1 then return end
+    dx, dy = dx / dist, dy / dist
+
+    -- 抛投距离 (根据当前蓄力)
+    local power = castState.power
+    local castDist = CFG.CAST_MIN_DIST + (CFG.CAST_MAX_DIST - CFG.CAST_MIN_DIST) * power
+
+    -- 起点/终点的屏幕坐标
+    local sx, sy = WorldToScreen(ax, ay)
+    local tx = ax + dx * castDist
+    local ty = ay + dy * castDist
+    local ex, ey = WorldToScreen(tx, ty)
+
+    -- 箭头方向 (屏幕空间)
+    local totalLen = math.sqrt((ex - sx)^2 + (ey - sy)^2)
+    if totalLen < 2 then return end
+    local ndx = (ex - sx) / totalLen
+    local ndy = (ey - sy) / totalLen
+    -- 法向量 (用于箭头宽度)
+    local nx = -ndy
+    local ny = ndx
+
+    -- ── 颜色: 绿(0) → 黄(0.5) → 红(1.0) ──
+    local cr, cg, cb
+    if power < 0.5 then
+        local t = power / 0.5
+        cr = math.floor(60 + 195 * t)   -- 60→255
+        cg = math.floor(220 - 20 * t)   -- 220→200
+        cb = 50
+    else
+        local t = (power - 0.5) / 0.5
+        cr = 255
+        cg = math.floor(200 - 160 * t)  -- 200→40
+        cb = math.floor(50 - 20 * t)    -- 50→30
+    end
+    local alpha = math.floor(150 + 105 * power)  -- 150→255
+
+    -- ── 箭头尺寸: 随蓄力从小到大 ──
+    local arrowHeadLen = 12 + 18 * power   -- 箭头头部长度 12→30
+    local arrowHeadW   = 6 + 10 * power    -- 箭头头部半宽 6→16
+    local shaftW       = 2 + 3 * power     -- 箭杆半宽 2→5
+
+    -- 箭杆终点 (箭头三角形前面留出空间)
+    local shaftEndLen = math.max(0, totalLen - arrowHeadLen)
+
+    -- ── 绘制箭杆 (渐变矩形: 起点透明→终点实色) ──
+    if shaftEndLen > 2 then
+        local s0x, s0y = sx, sy
+        local s1x = sx + ndx * shaftEndLen
+        local s1y = sy + ndy * shaftEndLen
+
+        -- 用线条简化绘制，宽度随蓄力增大
+        nvgLineCap(vg, NVG_ROUND)
+        nvgStrokeWidth(vg, shaftW * 2)
+
+        -- 渐变: 起点半透明 → 终点实色
+        local paint = nvgLinearGradient(vg, s0x, s0y, s1x, s1y,
+            nvgRGBA(cr, cg, cb, math.floor(alpha * 0.15)),
+            nvgRGBA(cr, cg, cb, alpha))
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, s0x, s0y)
+        nvgLineTo(vg, s1x, s1y)
+        nvgStrokePaint(vg, paint)
+        nvgStroke(vg)
+    end
+
+    -- ── 绘制箭头三角形 (实心) ──
+    local tipX, tipY = ex, ey  -- 箭尖 = 落点
+    local baseX = ex - ndx * arrowHeadLen
+    local baseY = ey - ndy * arrowHeadLen
+    local leftX  = baseX + nx * arrowHeadW
+    local leftY  = baseY + ny * arrowHeadW
+    local rightX = baseX - nx * arrowHeadW
+    local rightY = baseY - ny * arrowHeadW
+
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, tipX, tipY)
+    nvgLineTo(vg, leftX, leftY)
+    nvgLineTo(vg, rightX, rightY)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(cr, cg, cb, alpha))
+    nvgFill(vg)
+
+    -- 箭头边框 (微亮轮廓增加可读性)
+    nvgStrokeWidth(vg, 1.2)
+    nvgStrokeColor(vg, nvgRGBA(255, 255, 255, math.floor(alpha * 0.4)))
+    nvgStroke(vg)
+
+    -- ── 距离文字 (箭尖旁侧) ──
+    local distText = string.format("%.0fm", castDist)
+    local labelX = tipX + nx * (arrowHeadW + 10)
+    local labelY = tipY + ny * (arrowHeadW + 10)
+    nvgFontSize(vg, 11 + 3 * power)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    -- 阴影
+    nvgFillColor(vg, nvgRGBA(0, 0, 0, math.floor(alpha * 0.6)))
+    nvgText(vg, labelX + 1, labelY + 1, distText, nil)
+    -- 前景
+    nvgFillColor(vg, nvgRGBA(255, 255, 230, alpha))
+    nvgText(vg, labelX, labelY, distText, nil)
+end
+
+-- DrawCastPowerBar 已合并到 DrawCastAim 箭头中, 不再需要独立力度条
+function DrawCastPowerBar()
+    -- 保留空函数, 避免调用处报错
+end
+
+function DrawFishingLine(rodIndex)
+    local rod = rods[rodIndex]
+    local rope = rod.rope
+    if #rope == 0 then return end
+
+    -- 线颜色：选中的鱼竿更亮
+    local lineAlpha = (rodIndex == activeRod) and 200 or 120
+    local lineR, lineG, lineB = 220, 220, 220
+    if rodIndex == 1 then lineR, lineG, lineB = 220, 230, 255
+    elseif rodIndex == 2 then lineR, lineG, lineB = 255, 220, 200 end
+
+    -- 将所有绳索节点转换为屏幕坐标
+    -- 鱼竿在 sprite stack 层 6.5，需要对鱼线起点施加相同的垂直偏移
+    local rodStackOffset = STACK_OFFSET * 6.5
+    local isCasting = (rod.state == "casting" and rod.flyT ~= nil)
+    local isStriking = (rod.state == "strike" and strikeState.active and strikeState.rodIndex == rodIndex)
+    local pts = {}
+    -- 弯曲后竿尖的屏幕坐标 (由 DrawBoat 每帧直接缓存, 无需二次转换)
+    local bentTip = rodBentTips[rodIndex]
+    local bentTipSX = bentTip and bentTip.sx
+    local bentTipSY = bentTip and bentTip.sy
+    -- 计算物理竿尖与视觉竿尖的屏幕偏移量 (用于平滑过渡)
+    local tipOffsetX, tipOffsetY = 0, 0
+    if bentTipSX then
+        local physSX, physSY = WorldToScreen(rope[1].x, rope[1].y)
+        tipOffsetX = bentTipSX - physSX
+        tipOffsetY = bentTipSY - (physSY - rodStackOffset)
+    end
+    for i = 1, #rope do
+        local sx, sy = WorldToScreen(rope[i].x, rope[i].y)
+        if isCasting then
+            -- 飞行中: 所有节点在空中, 用抛物线偏移模拟高度
+            local frac = (i - 1) / (#rope - 1)  -- 节点在线上的位置 0~1
+            -- 从 stackYOff 高度过渡到水面
+            local tipBlend = math.max(0, 1.0 - frac * 4)  -- 前 25% 过渡
+            sy = sy - rodStackOffset * tipBlend
+            -- 视觉竿尖偏移: 从竿尖处全量应用, 向鱼饵端衰减到零
+            local bendBlend = math.max(0, 1.0 - frac * 3)  -- 前 33% 过渡
+            sx = sx + tipOffsetX * bendBlend
+            sy = sy + tipOffsetY * bendBlend
+            -- 抛物线弧度: 中间高两端低
+            local arcH = CFG.CAST_ARC_HEIGHT * rod.flyT  -- 飞得越远弧越高
+            local arc = 4 * frac * (1 - frac) * arcH
+            sy = sy - arc
+        elseif isStriking then
+            -- 抬杆中: 鱼线绷直 + 高频抖动
+            local frac = (i - 1) / (#rope - 1)
+            local st = strikeState.timer / CFG.STRIKE_DURATION
+            local liftNow = 0
+            if st < 0.3 then liftNow = st / 0.3
+            else liftNow = 1.0 - ((st - 0.3) / 0.7) end
+            if i == 1 and bentTipSX then
+                -- 竿尖: 直接使用缓存的屏幕坐标 (已含 strikeLift)
+                sx, sy = bentTipSX, bentTipSY
+            elseif i == 1 then
+                sy = sy - liftNow * CFG.STRIKE_LIFT_PX
+            else
+                local tipOffset = rodStackOffset + liftNow * CFG.STRIKE_LIFT_PX
+                local tipBlend = math.max(0, 1.0 - frac * 3)  -- 前 33% 过渡
+                sy = sy - tipOffset * tipBlend
+            end
+            -- 高频抖动 (衰减: 靠近竿尖和鱼饵的两端少抖, 中间多)
+            local shakeEnv = 4 * frac * (1 - frac)  -- 中间最大
+            local shakeDecay = math.max(0, 1.0 - st * 2)  -- 快速衰减
+            local shake = math.sin(gameTime * 80 + i * 1.7) * CFG.STRIKE_SHAKE_AMP * shakeEnv * shakeDecay
+            sy = sy + shake
+        else
+            -- 常态: 竿尖使用弯曲后视觉位置
+            if i == 1 and bentTipSX then
+                sx, sy = bentTipSX, bentTipSY
+            end
+        end
+        pts[i] = { x = sx, y = sy }
+    end
+
+    -- 逐段绘制鱼线，水面下部分透明度渐变
+    -- 节点 1-4 在水面上 (100% alpha)，节点 5+ 在水面下 (70% → 25% alpha)
+    local waterEntry = 4  -- 入水分界节点
+    local underwaterStart = 0.70  -- 入水处透明度比例
+    local underwaterEnd   = 0.25  -- 末端透明度比例
+    local totalUnderwater = #pts - waterEntry  -- 水下节点数
+
+    for i = 1, #pts - 1 do
+        -- 计算本段起点和终点的透明度
+        local function nodeAlpha(idx)
+            if isCasting or isStriking then
+                return lineAlpha  -- 飞行中/抬杆中全程不透明
+            end
+            if idx <= waterEntry then
+                return lineAlpha
+            else
+                local t = (idx - waterEntry) / totalUnderwater  -- 0→1
+                local ratio = underwaterStart + (underwaterEnd - underwaterStart) * t
+                return math.floor(lineAlpha * ratio)
+            end
+        end
+        local a1 = nodeAlpha(i)
+        local a2 = nodeAlpha(i + 1)
+        local aMid = math.floor((a1 + a2) / 2)
+
+        -- Catmull-Rom 控制点 (首尾虚拟引导点, 避免端点急转弯)
+        local p0, p1, p2, p3
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        if i == 1 then
+            -- 虚拟 p0: 沿 p1→p2 反向延伸, 让首段切线平滑指向线的方向
+            p0 = { x = p1.x * 2 - p2.x, y = p1.y * 2 - p2.y }
+        else
+            p0 = pts[i - 1]
+        end
+        if i + 2 <= #pts then
+            p3 = pts[i + 2]
+        else
+            -- 虚拟 p3: 沿 p1→p2 方向延伸
+            p3 = { x = p2.x * 2 - p1.x, y = p2.y * 2 - p1.y }
+        end
+        local cp1x = p1.x + (p2.x - p0.x) / 6
+        local cp1y = p1.y + (p2.y - p0.y) / 6
+        local cp2x = p2.x - (p3.x - p1.x) / 6
+        local cp2y = p2.y - (p3.y - p1.y) / 6
+
+        -- 绘制本段
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, p1.x, p1.y)
+        nvgBezierTo(vg, cp1x, cp1y, cp2x, cp2y, p2.x, p2.y)
+        nvgStrokeColor(vg, nvgRGBA(lineR, lineG, lineB, aMid))
+        nvgStrokeWidth(vg, 1.5)
+        nvgStroke(vg)
+
+        -- 阴影 (水面下逐渐消失)
+        local shadowAlpha = math.floor(30 * aMid / lineAlpha)
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, p1.x + 1.5, p1.y + 1.5)
+        nvgBezierTo(vg, cp1x + 1.5, cp1y + 1.5, cp2x + 1.5, cp2y + 1.5, p2.x + 1.5, p2.y + 1.5)
+        nvgStrokeColor(vg, nvgRGBA(0, 0, 0, shadowAlpha))
+        nvgStrokeWidth(vg, 2.0)
+        nvgStroke(vg)
+    end
+
+    -- 鱼饵位置 (末端节点)
+    local endX, endY = pts[#pts].x, pts[#pts].y
+
+    -- 鱼饵: 咬钩闪烁
+    if rod.state == "bite" then
+        local flash = math.sin(gameTime * 12) * 0.5 + 0.5
+        local glowR = 15 + flash * 10
+        local glow = nvgRadialGradient(vg, endX, endY, 2, glowR,
+            nvgRGBA(255, 200, 50, 180 * flash),
+            nvgRGBA(255, 200, 50, 0))
+        nvgBeginPath(vg)
+        nvgCircle(vg, endX, endY, glowR)
+        nvgFillPaint(vg, glow)
+        nvgFill(vg)
+    end
+
+    -- 鱼饵圆点
+    nvgBeginPath(vg)
+    nvgCircle(vg, endX, endY, 4)
+    nvgFillColor(vg, nvgRGBA(230, 60, 40, 230))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(255, 255, 255, 150))
+    nvgStrokeWidth(vg, 1)
+    nvgStroke(vg)
+
+    -- 鱼竿编号标识
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 11)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, lineAlpha))
+    nvgText(vg, endX, endY - 12, tostring(rodIndex), nil)
+
+    -- 拖钓进度指示 (小圆弧)
+    if rod.state == "trolling" and rod.biteAt > 0 then
+        local progress = math.min(1.0, rod.timer / rod.biteAt)
+        if progress > 0.01 then
+            nvgBeginPath(vg)
+            nvgArc(vg, endX, endY, 10, -math.pi / 2, -math.pi / 2 + progress * math.pi * 2, 1)
+            nvgStrokeColor(vg, nvgRGBA(100, 255, 100, 180))
+            nvgStrokeWidth(vg, 2.5)
+            nvgStroke(vg)
+        end
+    end
+end
+
+-- ============================================================================
+-- 遛鱼 HUD 渲染
+-- ============================================================================
+
+function DrawFight()
+    if not curFish then return end
+    local cx = screenW / 2
+    nvgFontFace(vg, "sans")
+
+    -- ════════════════════════════════════════════════════════════════
+    -- A. 底部浮动张力条 (始终可见, 紧凑)
+    -- ════════════════════════════════════════════════════════════════
+    local barW = math.min(840, screenW - 40)
+    local barH = 14
+    local barX = cx - barW / 2
+    local barY = screenH - 50
+
+    -- 张力值
+    local tensionRatio = fight.tensionVisual / CFG.FIGHT_LINE_STRENGTH
+    local dragKg = fight.drag * CFG.FIGHT_LINE_STRENGTH
+
+    -- 渐变色: 绿→橙→红
+    local tr, tg, tb
+    if tensionRatio <= 0.30 then
+        tr, tg, tb = 50, 180, 80
+    elseif tensionRatio <= 0.60 then
+        local t = (tensionRatio - 0.30) / 0.30
+        tr = math.floor(50  + (230 - 50)  * t)
+        tg = math.floor(180 + (150 - 180) * t)
+        tb = math.floor(80  + (40  - 80)  * t)
+    elseif tensionRatio <= 0.90 then
+        local t = (tensionRatio - 0.60) / 0.30
+        tr = math.floor(230 + (220 - 230) * t)
+        tg = math.floor(150 + (50  - 150) * t)
+        tb = math.floor(40  + (40  - 40)  * t)
+    else
+        tr, tg, tb = 220, 50, 40
+    end
+
+    -- 标题行: 鱼名 + 状态 + 张力数值
+    local fc = curFish.type.color
+    local behavText, behavR, behavG, behavB = "", 200, 200, 200
+    if fight.slipping then
+        behavText = " 出线!"
+        behavR, behavG, behavB = 255, 100, 60
+    elseif fight.reeling then
+        behavText = " 收线"
+        behavR, behavG, behavB = 100, 220, 160
+    elseif fight.fishStamina <= 0 then
+        behavText = " 疲惫"
+        behavR, behavG, behavB = 120, 200, 120
+    elseif fight.tanState == "active" then
+        behavText = " 挣扎"
+        behavR, behavG, behavB = 255, 200, 80
+    end
+
+    nvgFontSize(vg, 12)
+    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(fc[1], fc[2], fc[3], 230))
+    nvgText(vg, barX, barY - 10, curFish.type.name, nil)
+    if behavText ~= "" then
+        -- 状态紧跟鱼名后
+        local nameW = nvgTextBounds(vg, 0, 0, curFish.type.name)
+        nvgFillColor(vg, nvgRGBA(behavR, behavG, behavB, 220))
+        nvgText(vg, barX + nameW + 2, barY - 10, behavText, nil)
+    end
+
+    nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(220, 220, 230, 200))
+    nvgFontSize(vg, 11)
+    nvgText(vg, barX + barW, barY - 10,
+        string.format("%.1fkg / %.0fkg", fight.tensionVisual, CFG.FIGHT_LINE_STRENGTH), nil)
+
+    -- 背景槽
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, barX, barY, barW, barH, 4)
+    nvgFillColor(vg, nvgRGBA(15, 20, 35, 200))
+    nvgFill(vg)
+
+    -- 镜像双向填充
+    local halfW = barW * 0.5
+    local midX = barX + halfW
+    local fillPx = tensionRatio * halfW
+    if fillPx > 0 then
+        nvgBeginPath(vg)
+        nvgRect(vg, midX, barY, fillPx, barH)
+        nvgRect(vg, midX - fillPx, barY, fillPx, barH)
+        nvgFillColor(vg, nvgRGBA(tr, tg, tb, 220))
+        nvgFill(vg)
+    end
+
+    -- 中线
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, midX, barY - 2)
+    nvgLineTo(vg, midX, barY + barH + 2)
+    nvgStrokeColor(vg, nvgRGBA(255, 255, 255, 100))
+    nvgStrokeWidth(vg, 1)
+    nvgStroke(vg)
+
+    -- 张力超限闪烁
+    if tensionRatio > 0.85 then
+        local flash = math.sin(gameTime * 10) * 0.5 + 0.5
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, barX - 1, barY - 1, barW + 2, barH + 2, 5)
+        nvgStrokeColor(vg, nvgRGBA(255, 50, 30, math.floor(flash * 180)))
+        nvgStrokeWidth(vg, 2)
+        nvgStroke(vg)
+    end
+
+    -- ── 卷轮旋转图标 + 环形线长条 (张力条左侧) ──
+    do
+        local reelR = 14                     -- 卷轮内圈半径
+        local ringR = reelR + 5              -- 环形进度条半径
+        local reelCX = barX - ringR - 6      -- 条左侧留间距
+        local reelCY = barY + barH / 2       -- 垂直居中
+
+        -- 环形线长进度条 (外环)
+        local lineRatio = math.min(1, fight.lineLength / CFG.FIGHT_LINE_MAX)
+        local startAng = -math.pi / 2        -- 12点方向起始
+        local fullAng = math.pi * 2
+        -- 底圈 (暗色满环)
+        nvgBeginPath(vg)
+        nvgArc(vg, reelCX, reelCY, ringR, startAng, startAng + fullAng, 1)
+        nvgStrokeColor(vg, nvgRGBA(40, 50, 70, 150))
+        nvgStrokeWidth(vg, 3)
+        nvgStroke(vg)
+        -- 前景弧 (线长比例, 颜色随余量变化)
+        if lineRatio > 0.01 then
+            local lr, lg, lb
+            local remain = 1.0 - lineRatio
+            if remain > 0.4 then
+                lr, lg, lb = 80, 180, 220    -- 充足: 蓝色
+            elseif remain > 0.15 then
+                lr, lg, lb = 220, 180, 50    -- 偏少: 黄色
+            else
+                lr, lg, lb = 220, 60, 40     -- 危险: 红色
+            end
+            nvgBeginPath(vg)
+            nvgArc(vg, reelCX, reelCY, ringR, startAng, startAng + lineRatio * fullAng, 1)
+            nvgStrokeColor(vg, nvgRGBA(lr, lg, lb, 220))
+            nvgStrokeWidth(vg, 3)
+            nvgStroke(vg)
+        end
+
+        -- 卷轮外圈
+        nvgBeginPath(vg)
+        nvgCircle(vg, reelCX, reelCY, reelR)
+        nvgStrokeColor(vg, nvgRGBA(160, 170, 190, 180))
+        nvgStrokeWidth(vg, 1.5)
+        nvgStroke(vg)
+
+        -- 轴心
+        nvgBeginPath(vg)
+        nvgCircle(vg, reelCX, reelCY, 3)
+        nvgFillColor(vg, nvgRGBA(180, 190, 210, 200))
+        nvgFill(vg)
+
+        -- 旋转辐条 (4根, 随 reelAngle 旋转)
+        nvgSave(vg)
+        nvgTranslate(vg, reelCX, reelCY)
+        nvgRotate(vg, fight.reelAngle)
+        for s = 0, 3 do
+            local a = s * math.pi / 2
+            local cosA = math.cos(a)
+            local sinA = math.sin(a)
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, cosA * 4, sinA * 4)
+            nvgLineTo(vg, cosA * (reelR - 2), sinA * (reelR - 2))
+            -- 收线时辐条高亮, 打滑时橙色, 空闲时暗淡
+            if fight.slipping then
+                nvgStrokeColor(vg, nvgRGBA(255, 140, 50, 200))
+            elseif fight.reeling then
+                nvgStrokeColor(vg, nvgRGBA(100, 220, 180, 220))
+            else
+                nvgStrokeColor(vg, nvgRGBA(120, 130, 150, 120))
+            end
+            nvgStrokeWidth(vg, 1.5)
+            nvgStroke(vg)
+        end
+        nvgRestore(vg)
+    end
+
+    -- 操作提示 (张力条下方)
+    nvgFontSize(vg, 10)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(140, 150, 170, 140))
+    local reelHint = fight.reeling and "[收线中]" or "[左键]收线"
+    nvgText(vg, cx, barY + barH + 10,
+        reelHint .. "  [滚轮]刹车  [Tab]详情", nil)
+
+    -- ════════════════════════════════════════════════════════════════
+    -- B. 可折叠详情面板 (Tab 切换)
+    -- ════════════════════════════════════════════════════════════════
+    if fightDetailOpen then
+        local pW = math.min(340, screenW - 20)
+        local pH = 180
+        local pX = screenW - pW - 10
+        local pY = screenH - pH - 80
+
+        -- 面板背景
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, pX, pY, pW, pH, 8)
+        nvgFillColor(vg, nvgRGBA(8, 16, 32, 200))
+        nvgFill(vg)
+        nvgStrokeColor(vg, nvgRGBA(60, 120, 180, 80))
+        nvgStrokeWidth(vg, 1)
+        nvgStroke(vg)
+
+        local dBarX = pX + 10
+        local dBarW = pW - 20
+        local dBarH = 12
+
+        -- 通用条形
+        local function DrawDetailBar(y, label, ratio, r, g, b, showText)
+            nvgFontSize(vg, 10)
+            nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+            nvgFillColor(vg, nvgRGBA(160, 170, 190, 190))
+            nvgText(vg, dBarX, y - 7, label, nil)
+            if showText then
+                nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+                nvgFillColor(vg, nvgRGBA(200, 210, 220, 190))
+                nvgText(vg, dBarX + dBarW, y - 7, showText, nil)
+            end
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, dBarX, y, dBarW, dBarH, 3)
+            nvgFillColor(vg, nvgRGBA(20, 25, 40, 180))
+            nvgFill(vg)
+            local fw = math.max(0, math.min(1, ratio)) * dBarW
+            if fw > 1 then
+                nvgBeginPath(vg)
+                nvgRoundedRect(vg, dBarX, y, fw, dBarH, 3)
+                nvgFillColor(vg, nvgRGBA(r, g, b, 200))
+                nvgFill(vg)
+            end
+        end
+
+        -- 1. 出线量
+        local curY = pY + 14
+        local lineRatio = fight.lineLength / CFG.FIGHT_LINE_MAX
+        local lr, lg, lb = 80, 160, 230
+        if lineRatio > 0.8 then lr, lg, lb = 230, 140, 40 end
+        if lineRatio > 0.92 then lr, lg, lb = 230, 60, 40 end
+        DrawDetailBar(curY, "线长", lineRatio, lr, lg, lb,
+            string.format("%.0fm / %dm", fight.lineLength, CFG.FIGHT_LINE_MAX))
+
+        -- 2. 鱼距
+        curY = curY + dBarH + 14
+        local fishDistRatio = math.min(1, fight.fishRadius / CFG.FIGHT_LINE_MAX)
+        local fdr, fdg, fdb = 100, 180, 230
+        if fight.fishRadius < CFG.FIGHT_CATCH_DIST * 2 then fdr, fdg, fdb = 80, 220, 120 end
+        DrawDetailBar(curY, "鱼距", fishDistRatio, fdr, fdg, fdb,
+            string.format("%.0fm", fight.fishRadius))
+
+        -- 3. 鱼体力
+        curY = curY + dBarH + 14
+        local stamRatio = fight.fishStamina / fight.fishMaxStam
+        local sr, sg, sb = 230, 160, 50
+        if stamRatio < 0.3 then sr, sg, sb = 80, 200, 100 end
+        DrawDetailBar(curY, "鱼力", stamRatio, sr, sg, sb,
+            string.format("%d%%", math.ceil(stamRatio * 100)))
+
+        -- 4. 刹车档位
+        curY = curY + dBarH + 14
+        local totalGears = CFG.FIGHT_DRAG_GEARS
+        local isLocked = fight.dragGear >= totalGears
+        nvgFontSize(vg, 10)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(160, 170, 190, 190))
+        nvgText(vg, dBarX, curY, "刹车", nil)
+
+        -- 滑轨
+        local kTrackX = dBarX + 32
+        local kTrackW = dBarW - 70
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, kTrackX, curY + 3, kTrackW, 3, 1.5)
+        nvgFillColor(vg, nvgRGBA(50, 55, 70, 180))
+        nvgFill(vg)
+
+        -- 旋钮
+        local knobNorm = fight.dragGear / totalGears
+        local knobX = kTrackX + knobNorm * kTrackW
+        nvgBeginPath(vg)
+        nvgCircle(vg, knobX, curY + 4.5, 5)
+        nvgFillColor(vg, isLocked and nvgRGBA(255, 100, 80, 230) or nvgRGBA(190, 200, 220, 230))
+        nvgFill(vg)
+
+        -- 档位文字
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(190, 200, 220, 190))
+        local gearText = isLocked and "LOCK"
+            or string.format("%d/%d (%.0fkg)", fight.dragGear, totalGears - 1, dragKg)
+        nvgText(vg, dBarX + dBarW, curY + 1, gearText, nil)
+
+        -- 打滑/收线 动态边框
+        if fight.slipping then
+            local pulse = math.sin(gameTime * 8) * 0.3 + 0.7
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, pX + 2, pY + 2, pW - 4, pH - 4, 7)
+            nvgStrokeColor(vg, nvgRGBA(255, 80, 50, math.floor(pulse * 120)))
+            nvgStrokeWidth(vg, 1.5)
+            nvgStroke(vg)
+        elseif fight.reeling then
+            local pulse = math.sin(gameTime * 6) * 0.3 + 0.7
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, pX + 2, pY + 2, pW - 4, pH - 4, 7)
+            nvgStrokeColor(vg, nvgRGBA(100, 220, 160, math.floor(pulse * 80)))
+            nvgStrokeWidth(vg, 1)
+            nvgStroke(vg)
+        end
+    end
+
+    -- ════════════════════════════════════════════════════════════════
+    -- C. 诊断 (不受折叠影响)
+    -- ════════════════════════════════════════════════════════════════
+    if diagInfiniteLine then
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 13)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
+        nvgFillColor(vg, nvgRGBA(255, 220, 100, 220))
+        nvgText(vg, 10, 60, "[L]无限线长 ON")
+    end
+
+    -- 实时张力波形图
+    if diagChartOn and #diagChartBuf > 1 then
+        local chartW = math.min(480, screenW - 40)
+        local chartH = 120
+        local chartX = (screenW - chartW) / 2
+        local chartY = 10
+
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, chartX - 4, chartY - 4, chartW + 8, chartH + 24, 6)
+        nvgFillColor(vg, nvgRGBA(10, 15, 30, 200))
+        nvgFill(vg)
+
+        local yMax = CFG.FIGHT_LINE_STRENGTH
+        local dragRatio = fight.drag
+        local dragY = chartY + chartH - (dragRatio * CFG.FIGHT_LINE_STRENGTH / yMax) * chartH
+        nvgBeginPath(vg)
+        nvgStrokeColor(vg, nvgRGBA(255, 200, 80, 150))
+        nvgStrokeWidth(vg, 1)
+        local dashLen = 6
+        local ix = 0
+        while ix < chartW do
+            local segEnd = math.min(ix + dashLen, chartW)
+            nvgMoveTo(vg, chartX + ix, dragY)
+            nvgLineTo(vg, chartX + segEnd, dragY)
+            ix = ix + dashLen * 2
+        end
+        nvgStroke(vg)
+
+        local bufLen = math.min(#diagChartBuf, DIAG_CHART_LEN)
+        local points = math.min(bufLen, math.floor(chartW))
+        local step = bufLen / points
+
+        nvgBeginPath(vg)
+        local tMin, tMax = 999, -999
+        for i = 0, points - 1 do
+            local bufIdx = math.floor(i * step) + 1
+            local readIdx = ((diagChartIdx - bufLen + bufIdx - 1) % DIAG_CHART_LEN) + 1
+            local sample = diagChartBuf[readIdx]
+            if sample then
+                local px = chartX + (i / (points - 1)) * chartW
+                local py = chartY + chartH - (sample.tension / yMax) * chartH
+                py = math.max(chartY, math.min(chartY + chartH, py))
+                if i == 0 then
+                    nvgMoveTo(vg, px, py)
+                else
+                    nvgLineTo(vg, px, py)
+                end
+                if sample.tension < tMin then tMin = sample.tension end
+                if sample.tension > tMax then tMax = sample.tension end
+            end
+        end
+        nvgStrokeColor(vg, nvgRGBA(80, 200, 255, 220))
+        nvgStrokeWidth(vg, 1.5)
+        nvgStroke(vg)
+
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 11)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
+        nvgFillColor(vg, nvgRGBA(180, 180, 180, 200))
+        nvgText(vg, chartX + 2, chartY + 2, string.format("%.0fkg", yMax))
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_BOTTOM)
+        nvgText(vg, chartX + 2, chartY + chartH - 2, "0")
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_BOTTOM)
+        nvgFillColor(vg, nvgRGBA(255, 200, 80, 200))
+        nvgText(vg, chartX + chartW - 2, dragY - 2,
+            string.format("阈值%.0fkg", fight.drag * CFG.FIGHT_LINE_STRENGTH))
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
+        nvgFillColor(vg, nvgRGBA(100, 255, 200, 220))
+        if tMin < 900 then
+            nvgText(vg, chartX + chartW / 2, chartY + chartH + 2,
+                string.format("张力 %.1fkg  范围 %.1f~%.1f  振幅 %.1f  [H]关闭",
+                    fight.tension, tMin, tMax, tMax - tMin))
+        end
+    end
+end
+
+-- ============================================================================
+-- 结果界面
+-- ============================================================================
+
+function DrawCatchResult()
+    local cx = screenW / 2
+    local cy = screenH / 2
+
+    -- 背景
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, cx - 160, cy - 100, 320, 200, 14)
+    nvgFillColor(vg, nvgRGBA(10, 30, 20, 230))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(50, 200, 100, 180))
+    nvgStrokeWidth(vg, 2)
+    nvgStroke(vg)
+
+    nvgFontFace(vg, "sans")
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+
+    -- 标题
+    nvgFontSize(vg, 28)
+    nvgFillColor(vg, nvgRGBA(50, 255, 120, 255))
+    nvgText(vg, cx, cy - 60, "钓到了!", nil)
+
+    if curFish then
+        -- 鱼名
+        nvgFontSize(vg, 22)
+        nvgFillColor(vg, nvgRGBA(curFish.type.color[1], curFish.type.color[2], curFish.type.color[3], 255))
+        nvgText(vg, cx, cy - 25, curFish.type.name, nil)
+
+        -- 重量
+        nvgFontSize(vg, 18)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 220))
+        nvgText(vg, cx, cy + 5, string.format("重量: %.1f kg", curFish.weight), nil)
+
+        -- 鱼的简单图形
+        nvgBeginPath(vg)
+        nvgEllipse(vg, cx, cy + 40, 25, 12)
+        nvgFillColor(vg, nvgRGBA(curFish.type.color[1], curFish.type.color[2], curFish.type.color[3], 200))
+        nvgFill(vg)
+        -- 尾巴
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, cx - 25, cy + 40)
+        nvgLineTo(vg, cx - 38, cy + 30)
+        nvgLineTo(vg, cx - 38, cy + 50)
+        nvgClosePath(vg)
+        nvgFill(vg)
+    end
+
+    -- 提示
+    nvgFontSize(vg, 14)
+    nvgFillColor(vg, nvgRGBA(180, 180, 180, 200))
+    nvgText(vg, cx, cy + 75, "按空格键继续", nil)
+end
+
+function DrawFailResult()
+    local cx = screenW / 2
+    local cy = screenH / 2
+
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, cx - 140, cy - 60, 280, 120, 14)
+    nvgFillColor(vg, nvgRGBA(30, 15, 15, 230))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(200, 80, 60, 150))
+    nvgStrokeWidth(vg, 2)
+    nvgStroke(vg)
+
+    nvgFontFace(vg, "sans")
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+
+    nvgFontSize(vg, 24)
+    nvgFillColor(vg, nvgRGBA(255, 100, 80, 255))
+    nvgText(vg, cx, cy - 20, "鱼跑了...", nil)
+
+    nvgFontSize(vg, 14)
+    nvgFillColor(vg, nvgRGBA(180, 180, 180, 200))
+    nvgText(vg, cx, cy + 20, "按空格键继续", nil)
+end
+
+-- ============================================================================
+-- 菜单
+-- ============================================================================
+
+function DrawMenu()
+    local cx = screenW / 2
+    local cy = screenH / 2
+
+    -- 标题阴影
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 42)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(0, 20, 50, 180))
+    nvgText(vg, cx + 2, cy - 48, "海上钓鱼", nil)
+
+    -- 标题
+    nvgFillColor(vg, nvgRGBA(230, 245, 255, 255))
+    nvgText(vg, cx, cy - 50, "海上钓鱼", nil)
+
+    -- 副标题
+    nvgFontSize(vg, 18)
+    nvgFillColor(vg, nvgRGBA(150, 200, 230, 220))
+    nvgText(vg, cx, cy, "2D 俯视角拖钓游戏", nil)
+
+    -- 操作提示
+    nvgFontSize(vg, 15)
+    nvgFillColor(vg, nvgRGBA(200, 220, 240, 180))
+    nvgText(vg, cx, cy + 30, "WASD / 摇杆 - 开船 | F - 巡航", nil)
+    nvgText(vg, cx, cy + 50, "左键 - 收线 | 1/2 - 切换鱼竿", nil)
+    nvgText(vg, cx, cy + 70, "双鱼竿独立拖钓, 等待鱼咬钩!", nil)
+
+    -- 闪烁提示
+    local blink = math.sin(gameTime * 3) * 0.3 + 0.7
+    nvgFontSize(vg, 20)
+    nvgFillColor(vg, nvgRGBA(255, 220, 100, 255 * blink))
+    nvgText(vg, cx, cy + 110, "按空格键开始", nil)
+
+    -- 装饰: 小船图标
+    nvgSave(vg)
+    nvgTranslate(vg, cx, cy - 120)
+    local wobble = math.sin(gameTime * 2) * 5
+    nvgRotate(vg, math.sin(gameTime * 1.5) * 0.1)
+    nvgTranslate(vg, 0, wobble)
+
+    -- 简单船形
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -18)
+    nvgLineTo(vg, 10, 10)
+    nvgLineTo(vg, -10, 10)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(180, 130, 70, 220))
+    nvgFill(vg)
+
+    -- 桅杆
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -15)
+    nvgLineTo(vg, 0, -35)
+    nvgStrokeColor(vg, nvgRGBA(200, 160, 100, 220))
+    nvgStrokeWidth(vg, 2)
+    nvgStroke(vg)
+
+    -- 旗子
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -35)
+    nvgLineTo(vg, 12, -30)
+    nvgLineTo(vg, 0, -25)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(230, 70, 50, 220))
+    nvgFill(vg)
+
+    nvgRestore(vg)
+end
+
+-- ============================================================================
+-- 航海图 (全屏地图)
+-- ============================================================================
+
+function DrawMap()
+    if not mapOpen then return end
+
+    nvgSave(vg)
+
+    -- ── 背景遮罩 ────────────────────────────────────────────────────────
+    nvgBeginPath(vg)
+    nvgRect(vg, 0, 0, screenW, screenH)
+    nvgFillColor(vg, nvgRGBA(8, 18, 38, 210))
+    nvgFill(vg)
+
+    -- ── 地图区域（屏幕居中，留边距，等比缩放） ──────────────────────────
+    local margin = 60
+    local mapAreaW = screenW - margin * 2
+    local mapAreaH = screenH - margin * 2 - 40  -- 上方留标题空间
+
+    -- 动态计算世界坐标范围
+    local allIslands = IslandSystem.GetIslands()
+    local minX, minY =  math.huge,  math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    for _, isl in pairs(allIslands) do
+        local hw, hh = isl.w * 0.5, isl.h * 0.5
+        if isl.x - hw < minX then minX = isl.x - hw end
+        if isl.y - hh < minY then minY = isl.y - hh end
+        if isl.x + hw > maxX then maxX = isl.x + hw end
+        if isl.y + hh > maxY then maxY = isl.y + hh end
+    end
+    -- 扩展边界，让船只在边缘时也能显示
+    local padW = (maxX - minX) * 0.08
+    local padH = (maxY - minY) * 0.08
+    minX = minX - padW;  maxX = maxX + padW
+    minY = minY - padH;  maxY = maxY + padH
+
+    local worldW = maxX - minX
+    local worldH = maxY - minY
+
+    -- 等比缩放
+    local scale = math.min(mapAreaW / worldW, mapAreaH / worldH)
+    local drawW = worldW * scale
+    local drawH = worldH * scale
+    local ox = (screenW - drawW) * 0.5   -- 地图左上角 x
+    local oy = margin + 40 + (mapAreaH - drawH) * 0.5  -- 地图左上角 y
+
+    -- 世界坐标 → 地图屏幕坐标
+    local function W2M(wx, wy)
+        local mx = ox + (wx - minX) / worldW * drawW
+        local my = oy + (wy - minY) / worldH * drawH
+        return mx, my
+    end
+
+    -- ── 地图背景框 ──────────────────────────────────────────────────────
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, ox - 8, oy - 8, drawW + 16, drawH + 16, 6)
+    nvgFillColor(vg, nvgRGBA(12, 30, 60, 180))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(80, 140, 200, 120))
+    nvgStrokeWidth(vg, 1.5)
+    nvgStroke(vg)
+
+    -- ── 网格线 ──────────────────────────────────────────────────────────
+    nvgStrokeColor(vg, nvgRGBA(40, 80, 130, 50))
+    nvgStrokeWidth(vg, 0.5)
+    local gridStep = 2000
+    local gx = math.ceil(minX / gridStep) * gridStep
+    while gx < maxX do
+        local sx = ox + (gx - minX) / worldW * drawW
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, sx, oy)
+        nvgLineTo(vg, sx, oy + drawH)
+        nvgStroke(vg)
+        gx = gx + gridStep
+    end
+    local gy = math.ceil(minY / gridStep) * gridStep
+    while gy < maxY do
+        local sy = oy + (gy - minY) / worldH * drawH
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, ox, sy)
+        nvgLineTo(vg, ox + drawW, sy)
+        nvgStroke(vg)
+        gy = gy + gridStep
+    end
+
+    -- ── 岛屿轮廓 ────────────────────────────────────────────────────────
+    for id, isl in pairs(allIslands) do
+        local contour = isl.contour
+        if contour and #contour >= 3 then
+            nvgBeginPath(vg)
+            for ci, pt in ipairs(contour) do
+                local wx = isl.x + pt[1] * isl.w
+                local wy = isl.y + pt[2] * isl.h
+                local mx, my = W2M(wx, wy)
+                if ci == 1 then
+                    nvgMoveTo(vg, mx, my)
+                else
+                    nvgLineTo(vg, mx, my)
+                end
+            end
+            nvgClosePath(vg)
+            nvgFillColor(vg, nvgRGBA(90, 165, 90, 160))
+            nvgFill(vg)
+            nvgStrokeColor(vg, nvgRGBA(140, 210, 140, 200))
+            nvgStrokeWidth(vg, 1.0)
+            nvgStroke(vg)
+
+            -- 岛屿编号
+            local cx, cy = W2M(isl.x, isl.y)
+            nvgFontFace(vg, "sans")
+            nvgFontSize(vg, 11)
+            nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+            nvgFillColor(vg, nvgRGBA(220, 240, 220, 200))
+            nvgText(vg, cx, cy, tostring(id), nil)
+        end
+    end
+
+    -- ── 船只标记（黄色三角箭头） ────────────────────────────────────────
+    local bx, by = W2M(boat.x, boat.y)
+    local arrowSize = 8
+    local angle = boat.angle  -- 0=上(北)
+    nvgSave(vg)
+    nvgTranslate(vg, bx, by)
+    nvgRotate(vg, angle)
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, 0, -arrowSize)         -- 尖端（朝向方向）
+    nvgLineTo(vg, -arrowSize * 0.6, arrowSize * 0.5)
+    nvgLineTo(vg, arrowSize * 0.6, arrowSize * 0.5)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(255, 220, 60, 240))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(180, 140, 20, 255))
+    nvgStrokeWidth(vg, 1.5)
+    nvgStroke(vg)
+    nvgRestore(vg)
+
+    -- 船只位置脉冲光圈
+    local pulse = 0.5 + 0.5 * math.sin(gameTime * 4)
+    local ringR = 12 + pulse * 4
+    nvgBeginPath(vg)
+    nvgCircle(vg, bx, by, ringR)
+    nvgStrokeColor(vg, nvgRGBA(255, 220, 60, math.floor(60 + 60 * pulse)))
+    nvgStrokeWidth(vg, 1.0)
+    nvgStroke(vg)
+
+    -- ── 标题 ────────────────────────────────────────────────────────────
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 22)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(200, 220, 255, 230))
+    nvgText(vg, screenW * 0.5, margin + 16, "航海图", nil)
+
+    -- ── 罗盘方向标 ──────────────────────────────────────────────────────
+    nvgFontSize(vg, 12)
+    nvgFillColor(vg, nvgRGBA(150, 180, 220, 160))
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_BOTTOM)
+    nvgText(vg, ox + drawW * 0.5, oy - 4, "N", nil)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
+    nvgText(vg, ox + drawW * 0.5, oy + drawH + 4, "S", nil)
+    nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+    nvgText(vg, ox - 6, oy + drawH * 0.5, "W", nil)
+    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+    nvgText(vg, ox + drawW + 6, oy + drawH * 0.5, "E", nil)
+
+    -- ── 操作提示 ────────────────────────────────────────────────────────
+    nvgFontSize(vg, 14)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(180, 200, 230, 160))
+    nvgText(vg, screenW * 0.5, screenH - margin * 0.5, "[M] 关闭地图", nil)
+
+    nvgRestore(vg)
+end
+
+-- ============================================================================
+-- HUD
+-- ============================================================================
+
+function DrawHUD()
+    nvgFontFace(vg, "sans")
+
+    -- 左上: 收获统计
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, 10, 10, 170, 55, 8)
+    nvgFillColor(vg, nvgRGBA(10, 20, 40, 180))
+    nvgFill(vg)
+
+    nvgFontSize(vg, 14)
+    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(200, 220, 255, 220))
+    nvgText(vg, 20, 28, "收获: " .. #caughtList .. " 条", nil)
+
+    nvgFillColor(vg, nvgRGBA(255, 220, 100, 220))
+    nvgText(vg, 20, 48, string.format("总重: %.1f kg", totalWeight), nil)
+
+    -- 左上偏下: 鱼竿状态面板
+    if STATE == "sailing" then
+        local panelY = 75
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, 10, panelY, 170, 58, 8)
+        nvgFillColor(vg, nvgRGBA(10, 20, 40, 180))
+        nvgFill(vg)
+
+        for i = 1, CFG.ROD_COUNT do
+            local rod = rods[i]
+            local ry = panelY + 8 + (i - 1) * 24
+            local isActive = (i == activeRod)
+
+            -- 选中标记
+            if isActive then
+                nvgBeginPath(vg)
+                nvgRoundedRect(vg, 14, ry - 2, 160, 20, 4)
+                nvgFillColor(vg, nvgRGBA(40, 80, 140, 100))
+                nvgFill(vg)
+            end
+
+            -- 鱼竿编号
+            nvgFontSize(vg, 13)
+            nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+            local labelColor = isActive and nvgRGBA(255, 255, 255, 255) or nvgRGBA(160, 170, 180, 200)
+            nvgFillColor(vg, labelColor)
+            nvgText(vg, 20, ry + 8, "竿" .. i .. ":", nil)
+
+            -- 状态文字
+            local stText, stR, stG, stB = "待机", 130, 130, 140
+            if rod.state == "trolling" then
+                stText = "拖钓中"
+                stR, stG, stB = 100, 255, 150
+            elseif rod.state == "bite" then
+                stText = "咬钩!"
+                stR, stG, stB = 255, 200, 50
+            elseif rod.state == "strike" then
+                stText = "提竿!"
+                stR, stG, stB = 255, 255, 100
+            elseif rod.state == "casting" then
+                stText = "抛投..."
+                stR, stG, stB = 150, 200, 255
+            end
+            nvgFillColor(vg, nvgRGBA(stR, stG, stB, 240))
+            nvgText(vg, 60, ry + 8, stText, nil)
+
+            -- 快捷键提示
+            nvgFontSize(vg, 10)
+            nvgFillColor(vg, nvgRGBA(120, 130, 150, 150))
+            nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+            nvgText(vg, 170, ry + 8, "[" .. i .. "]", nil)
+        end
+    end
+
+    -- 右上: 状态指示
+    local stateText = ""
+    local stateColor = {200, 200, 200, 200}
+    if STATE == "sailing" then
+        if boat.cruise then
+            stateText = "巡航中"
+            stateColor = {80, 220, 180, 240}
+        elseif AnyRodActive() then
+            stateText = "拖钓航行"
+            stateColor = {100, 255, 150, 220}
+        else
+            stateText = "航行中"
+            stateColor = {100, 200, 255, 220}
+        end
+    elseif STATE == "fight" then
+        stateText = "遛鱼中!"
+        stateColor = {255, 150, 50, 255}
+    end
+
+    if stateText ~= "" then
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, screenW - 140, 10, 130, 32, 8)
+        nvgFillColor(vg, nvgRGBA(10, 20, 40, 180))
+        nvgFill(vg)
+
+        nvgFontSize(vg, 14)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(stateColor[1], stateColor[2], stateColor[3], stateColor[4]))
+        nvgText(vg, screenW - 75, 26, stateText, nil)
+    end
+
+    -- 右上偏下: 巡航按钮提示
+    if STATE == "sailing" then
+        local cruiseY = 50
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, screenW - 140, cruiseY, 130, 24, 6)
+        if boat.cruise then
+            nvgFillColor(vg, nvgRGBA(30, 100, 80, 200))
+        else
+            nvgFillColor(vg, nvgRGBA(10, 20, 40, 140))
+        end
+        nvgFill(vg)
+
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        if boat.cruise then
+            nvgFillColor(vg, nvgRGBA(100, 255, 200, 255))
+            nvgText(vg, screenW - 75, cruiseY + 12, "[F] 巡航 ON", nil)
+        else
+            nvgFillColor(vg, nvgRGBA(150, 160, 170, 180))
+            nvgText(vg, screenW - 75, cruiseY + 12, "[F] 巡航 OFF", nil)
+        end
+    end
+
+    -- 右上: 资源栏 (金钱 + 木料)
+    do
+        local resX = screenW - 140
+        local resY = 82
+        local resW = 130
+        local resH = 46
+
+        -- 背景
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, resX, resY, resW, resH, 8)
+        nvgFillColor(vg, nvgRGBA(10, 20, 40, 180))
+        nvgFill(vg)
+
+        nvgFontSize(vg, 13)
+
+        -- 金钱行: 金币图标 + 数值
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 220, 80, 230))
+        nvgText(vg, resX + 10, resY + 14, "💰", nil)
+        nvgFillColor(vg, nvgRGBA(255, 230, 140, 230))
+        nvgText(vg, resX + 30, resY + 14, tostring(PlayerData.GetMoney()), nil)
+
+        -- 木料行: 木头图标 + 数值
+        nvgFillColor(vg, nvgRGBA(180, 140, 80, 230))
+        nvgText(vg, resX + 10, resY + 34, "🪵", nil)
+        nvgFillColor(vg, nvgRGBA(210, 180, 130, 230))
+        nvgText(vg, resX + 30, resY + 34, tostring(PlayerData.GetResource("wood")), nil)
+    end
+
+    -- 右上: 燃油进度条 (在资源栏下方)
+    do
+        local fuelX = screenW - 140
+        local fuelY = 134
+        local fuelW = 130
+        local fuelH = 22
+
+        -- 背景面板
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, fuelX, fuelY, fuelW, fuelH, 6)
+        nvgFillColor(vg, nvgRGBA(10, 20, 40, 180))
+        nvgFill(vg)
+
+        -- 燃油图标
+        nvgFontSize(vg, 11)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 160, 60, 230))
+        nvgText(vg, fuelX + 5, fuelY + fuelH / 2, "⛽", nil)
+
+        -- 进度条背景
+        local barX = fuelX + 24
+        local barY = fuelY + 6
+        local barW = fuelW - 30
+        local barH = fuelH - 12
+
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, barX, barY, barW, barH, 4)
+        nvgFillColor(vg, nvgRGBA(20, 20, 30, 180))
+        nvgFill(vg)
+
+        -- 进度条填充 (颜色随燃油变化: 绿 → 黄 → 红)
+        local fuel = PlayerData.GetFuel()
+        local fuelMax = PlayerData.GetFuelMax()
+        local pct = math.max(0, math.min(1, fuel / fuelMax))
+        local fillW = barW * pct
+
+        local r, g, b
+        if pct > 0.5 then
+            -- 绿色到黄色
+            local t = (pct - 0.5) / 0.5
+            r = math.floor(255 * (1 - t))
+            g = 220
+            b = math.floor(60 * (1 - t))
+        else
+            -- 黄色到红色
+            local t = pct / 0.5
+            r = 255
+            g = math.floor(220 * t)
+            b = 0
+        end
+
+        if fillW > 0 then
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, barX, barY, fillW, barH, 4)
+            nvgFillColor(vg, nvgRGBA(r, g, b, 220))
+            nvgFill(vg)
+        end
+
+        -- 燃油数值文字
+        nvgFontSize(vg, 10)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 200))
+        nvgText(vg, barX + barW / 2, barY + barH / 2, string.format("%d/%d", math.ceil(fuel), fuelMax), nil)
+    end
+
+    -- 右上: 鱼群密度侦察（调试用，在燃油条下方）
+    local DENSITY_LEVELS = 10
+    do
+        local dbg = MapSampler.DebugFishDensity(boat.x, boat.y)
+        local densityCoeff = dbg.coeff
+        local densityLevel = dbg.level
+        local dxUI = screenW - 140
+        local dyUI = 164
+        local dwUI = 130
+        local dhUI = 20
+
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, dxUI, dyUI, dwUI, dhUI, 6)
+        nvgFillColor(vg, nvgRGBA(10, 20, 40, 180))
+        nvgFill(vg)
+
+        -- 鱼图标
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 255, 255, 200))
+        nvgText(vg, dxUI + 5, dyUI + dhUI / 2, "🐟", nil)
+
+        -- 密度条（10格小方块）
+        local blockW = 8
+        local blockH = 10
+        local blockGap = 1
+        local blocksX = dxUI + 24
+        local blocksY = dyUI + (dhUI - blockH) / 2
+        local activeBars = DENSITY_LEVELS - densityLevel + 1  -- 等级1→10格亮，等级10→1格亮
+
+        for i = 1, DENSITY_LEVELS do
+            nvgBeginPath(vg)
+            nvgRect(vg, blocksX + (i - 1) * (blockW + blockGap), blocksY, blockW, blockH)
+            if i <= activeBars then
+                -- 从绿到黄到红的渐变
+                local t = (i - 1) / (DENSITY_LEVELS - 1)
+                local br = math.floor(80 + 175 * t)
+                local bg = math.floor(220 - 120 * t)
+                nvgFillColor(vg, nvgRGBA(br, bg, 60, 220))
+            else
+                nvgFillColor(vg, nvgRGBA(40, 45, 60, 120))
+            end
+            nvgFill(vg)
+        end
+
+        -- 系数文字
+        nvgFontSize(vg, 10)
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(200, 220, 255, 180))
+        nvgText(vg, dxUI + dwUI - 4, dyUI + dhUI / 2, string.format("x%.2f", densityCoeff), nil)
+
+        -- ── 调试详情（密度条下方）──
+        nvgFontSize(vg, 9)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
+        nvgFillColor(vg, nvgRGBA(180, 200, 255, 200))
+        local debugY = dyUI + dhUI + 4
+        local lineH = 11
+
+        nvgText(vg, dxUI, debugY, string.format("world: %.0f, %.0f", boat.x, boat.y), nil)
+        debugY = debugY + lineH
+        nvgText(vg, dxUI, debugY, string.format("pixel: %d, %d", dbg.px, dbg.py), nil)
+        debugY = debugY + lineH
+        nvgText(vg, dxUI, debugY, string.format("img: %dx%d  s=%.1f", dbg.layerW, dbg.layerH, dbg.scale), nil)
+        debugY = debugY + lineH
+        local boundsStr = dbg.inBounds and "IN" or "OUT!"
+        local boundsColor = dbg.inBounds and nvgRGBA(100, 255, 100, 220) or nvgRGBA(255, 80, 80, 220)
+        nvgFillColor(vg, boundsColor)
+        nvgText(vg, dxUI, debugY, string.format("bounds: %s  R=%.3f", boundsStr, dbg.rawR), nil)
+        debugY = debugY + lineH
+        nvgFillColor(vg, nvgRGBA(180, 200, 255, 200))
+        nvgText(vg, dxUI, debugY, string.format("lvl=%d coeff=%.2f", dbg.level, dbg.coeff), nil)
+        debugY = debugY + lineH
+        -- 诊断：显示数据源类型
+        nvgFillColor(vg, nvgRGBA(255, 255, 100, 220))
+        nvgText(vg, dxUI, debugY, "src=LuaData", nil)
+    end
+
+    -- 底部中: 速度条
+    if STATE == "sailing" then
+        local barW = 120
+        local barH = 6
+        local barX = screenW / 2 - barW / 2
+        local barY = screenH - 30
+
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, barX, barY, barW, barH, 3)
+        nvgFillColor(vg, nvgRGBA(30, 30, 50, 150))
+        nvgFill(vg)
+
+        local speedPct = boat.speed / CFG.BOAT_MAX_SPEED
+        local barColorR = boat.cruise and 80 or 80
+        local barColorG = boat.cruise and 230 or 200
+        local barColorB = boat.cruise and 200 or 255
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, barX, barY, barW * speedPct, barH, 3)
+        nvgFillColor(vg, nvgRGBA(barColorR, barColorG, barColorB, 200))
+        nvgFill(vg)
+
+        nvgFontSize(vg, 11)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_BOTTOM)
+        nvgFillColor(vg, nvgRGBA(180, 200, 220, 150))
+        local speedLabel = string.format("%.0f kn", boat.speed * 0.5)
+        if boat.cruise then speedLabel = speedLabel .. " [巡航]" end
+        nvgText(vg, screenW / 2, barY - 3, speedLabel, nil)
+    end
+
+    -- 操作提示
+    if STATE == "sailing" then
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_BOTTOM)
+        nvgFillColor(vg, nvgRGBA(180, 200, 220, 120))
+        nvgText(vg, screenW / 2, screenH - 45, "左键:收线 | F:巡航 | 1/2:切鱼竿", nil)
+    end
+
+    -- 背包面板（最上层绘制）
+    if inventoryOpen then
+        Inventory.Draw(vg, screenW, screenH, {
+            rods = rods,
+            activeRod = activeRod,
+            caughtList = caughtList,
+            totalWeight = totalWeight,
+            PlayerData = PlayerData,
+        })
+    end
+
+    if islandMenuOpen and dockedIsland then
+        IslandMenu.Draw(vg, screenW, screenH, {
+            island      = dockedIsland,
+            caughtList  = caughtList,
+            totalWeight = totalWeight,
+            PlayerData  = PlayerData,
+        })
+    end
+end
+
+-- ============================================================================
+-- 开发者鱼种选择菜单
+-- ============================================================================
+
+function DrawDevFishSelect()
+    if not devFishSelect then return end
+
+    local cx = screenW * 0.5
+    local cy = screenH * 0.5
+    local pw = 320   -- 面板宽度
+    local lineH = 36 -- 每行高度
+    local titleH = 44
+    local count = #FISH_TYPES
+    local ph = titleH + count * lineH + 16  -- 面板高度
+    local px = cx - pw * 0.5
+    local py = cy - ph * 0.5
+
+    -- 半透明遮罩
+    nvgBeginPath(vg)
+    nvgRect(vg, 0, 0, screenW, screenH)
+    nvgFillColor(vg, nvgRGBA(0, 0, 0, 120))
+    nvgFill(vg)
+
+    -- 面板背景
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, px, py, pw, ph, 10)
+    nvgFillColor(vg, nvgRGBA(20, 30, 50, 220))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(100, 180, 255, 180))
+    nvgStrokeWidth(vg, 2)
+    nvgStroke(vg)
+
+    -- 标题
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 20)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(255, 150, 255, 255))
+    nvgText(vg, cx, py + titleH * 0.5, "[DEV] 选择鱼种")
+
+    -- 鱼种列表
+    for i, ft in ipairs(FISH_TYPES) do
+        local ly = py + titleH + (i - 1) * lineH + lineH * 0.5
+        local r, g, b = ft.color[1], ft.color[2], ft.color[3]
+
+        -- 序号
+        nvgFontSize(vg, 18)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(255, 220, 100, 255))
+        nvgText(vg, px + 16, ly, "[" .. i .. "]")
+
+        -- 鱼名 (用鱼种颜色)
+        nvgFillColor(vg, nvgRGBA(r, g, b, 255))
+        nvgText(vg, px + 52, ly, ft.name)
+
+        -- 难度星级
+        local stars = string.rep("★", ft.diff)
+        nvgFillColor(vg, nvgRGBA(255, 200, 50, 255))
+        nvgText(vg, px + 120, ly, stars)
+
+        -- 体力/拉力
+        nvgFontSize(vg, 14)
+        nvgFillColor(vg, nvgRGBA(180, 190, 210, 200))
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
+        local info = string.format("体力%d 力%dkg", ft.stamina, ft.maxForce)
+        nvgText(vg, px + pw - 16, ly, info)
+    end
+end
+
+-- ============================================================================
+-- 通知
+-- ============================================================================
+
+function DrawNotification()
+    if notify.timer <= 0 then return end
+
+    local alpha = math.min(1, notify.timer / 0.5) * 255
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 18)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+
+    local ny = screenH * 0.3
+
+    -- 背景
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, screenW / 2 - 180, ny - 18, 360, 36, 8)
+    nvgFillColor(vg, nvgRGBA(10, 20, 40, alpha * 0.75))
+    nvgFill(vg)
+
+    -- 文字
+    nvgFillColor(vg, nvgRGBA(notify.color[1], notify.color[2], notify.color[3], alpha))
+    nvgText(vg, screenW / 2, ny, notify.text, nil)
+end
+
+-- ============================================================================
+-- 虚拟控件
+-- ============================================================================
+
+function DrawVirtualControls()
+    -- 虚拟摇杆 (左下)
+    local jx = 70
+    local jy = screenH - 90
+    local jR = CFG.JOYSTICK_R
+
+    -- 外圈
+    nvgBeginPath(vg)
+    nvgCircle(vg, jx, jy, jR)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 20))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(255, 255, 255, 50))
+    nvgStrokeWidth(vg, 1.5)
+    nvgStroke(vg)
+
+    -- 内圈 (跟随摇杆方向)
+    local innerX = jx + vJoy.dx * jR * 0.6
+    local innerY = jy + vJoy.dy * jR * 0.6
+    if not vJoy.active then
+        innerX = jx
+        innerY = jy
+    end
+    nvgBeginPath(vg)
+    nvgCircle(vg, innerX, innerY, CFG.JOYSTICK_INNER)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 60))
+    nvgFill(vg)
+
+    -- 动作按钮 (右下)
+    local bx = screenW - 60
+    local by = screenH - 80
+    local bR = CFG.ACTION_BTN_R
+
+    nvgBeginPath(vg)
+    nvgCircle(vg, bx, by, bR)
+    local btnAlpha = actionDown and 80 or 40
+    nvgFillColor(vg, nvgRGBA(255, 220, 100, btnAlpha))
+    nvgFill(vg)
+    nvgStrokeColor(vg, nvgRGBA(255, 220, 100, 100))
+    nvgStrokeWidth(vg, 2)
+    nvgStroke(vg)
+
+    -- 按钮文字
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 13)
+    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 150))
+    local btnText = STATE == "trolling" and "收线" or "钓鱼"
+    nvgText(vg, bx, by, btnText, nil)
+end
+
+-- ============================================================================
+-- 引擎回调
+-- ============================================================================
+
+function GetScreenJoystickPatchString()
+    return "<patch><add sel=\"/element/element[./attribute[@name='Name' and @value='Hat0']]\"><attribute name=\"Is Visible\" value=\"false\" /></add></patch>"
+end
