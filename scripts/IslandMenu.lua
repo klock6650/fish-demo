@@ -1,585 +1,383 @@
 -- ============================================================================
--- IslandMenu: 岛屿商店 UI 模块
--- ============================================================================
--- 停靠岛屿后的交易面板：卖鱼换钱、补充燃油。
--- 由 main.lua 传入上下文，返回操作结果。
+-- IslandMenu: 岛屿 UI 模块
+-- Level 1: 功能选择对话框（黑色圆角矩形，无描边，鼠标点击）
 -- ============================================================================
 
 local IslandMenu = {}
 
--- ── feature → 标签页映射 ─────────────────────────────────────────────────────
--- 每个 feature key 对应一个标签页的显示名和绘制/按键处理函数名
-local FEATURE_META = {
-    sell_fish = { label = "卖鱼",  drawFn = "_DrawSellTab",   keyFn = "_HandleSellKey"   },
-    refuel    = { label = "补给",  drawFn = "_DrawSupplyTab",  keyFn = "_HandleSupplyKey"  },
-    -- 未来扩展示例:
-    -- repair    = { label = "修船",  drawFn = "_DrawRepairTab",  keyFn = "_HandleRepairKey"  },
-    -- upgrade   = { label = "升级",  drawFn = "_DrawUpgradeTab", keyFn = "_HandleUpgradeKey" },
-    -- quest     = { label = "任务",  drawFn = "_DrawQuestTab",   keyFn = "_HandleQuestKey"   },
+-- ── 对话框 UI 图片 ───────────────────────────────────────────────────────────
+local imgDialogBg  = -1   -- 切片3: 米白色有机大背景
+local imgNameTag   = -1   -- 切片1: 金黄气泡名字框
+local imgButton    = -1   -- 切片2: 黑色选项按钮
+
+-- 原始尺寸（SVG viewBox）
+local BG_W, BG_H   = 1128, 260
+local TAG_W, TAG_H  = 236,  105
+local BTN_W, BTN_H  = 294,   64
+
+-- ── NPC 半身绘图片 ────────────────────────────────────────────────────────────
+local imgNpcF01 = -1   -- f01 半身绘（岛屿11 巴兰）
+local imgNpcF02 = -1   -- f02 半身绘（岛屿2  于勒）
+local imgNpcF03 = -1   -- f03 半身绘（岛屿10 塔莎）
+
+-- ── 岛屿 → NPC 定制配置 ──────────────────────────────────────────────────────
+-- halfBody: 半身绘图片句柄引用名，imgW/imgH 为图片原始像素尺寸
+local ISLAND_NPC_CONFIG = {
+    [10] = { name = "塔莎", dialog = "你好 欢迎光临深流渔具店\n这里卖渔具 也卖情报.",    halfBodyRef = "f03", halfBodyW = 561, halfBodyH = 499 },
+    [2]  = { name = "于勒", dialog = "珍珠贝里可能藏着珍珠\n怎么样 要不要试试手气?", halfBodyRef = "f02", halfBodyW = 561, halfBodyH = 499 },
+    [11] = { name = "巴兰", dialog = "要改装你的船嘛?",                                    halfBodyRef = "f01", halfBodyW = 560, halfBodyH = 499 },
 }
 
+function IslandMenu.Init(vg)
+    imgDialogBg = nvgCreateImage(vg, "image/ui/dialog_box/dialog_bg.png",  0)
+    imgNameTag  = nvgCreateImage(vg, "image/ui/dialog_box/dialog_name_tag.png", 0)
+    imgButton   = nvgCreateImage(vg, "image/ui/dialog_box/dialog_button.png",   0)
+    if imgDialogBg <= 0 then print("[WARN] dialog_bg not loaded") end
+    if imgNameTag  <= 0 then print("[WARN] dialog_name_tag not loaded") end
+    if imgButton   <= 0 then print("[WARN] dialog_button not loaded") end
+
+    -- 加载 NPC 半身绘
+    imgNpcF01 = nvgCreateImage(vg, "image/npc/f01.png.png", 0)
+    imgNpcF02 = nvgCreateImage(vg, "image/npc/f02.png.png", 0)
+    imgNpcF03 = nvgCreateImage(vg, "image/npc/f03.png.png", 0)
+    if imgNpcF01 <= 0 then print("[WARN] npc f01 not loaded") end
+    if imgNpcF02 <= 0 then print("[WARN] npc f02 not loaded") end
+    if imgNpcF03 <= 0 then print("[WARN] npc f03 not loaded") end
+end
+
+-- ── 获取半身绘图片句柄 ────────────────────────────────────────────────────────
+local function getNpcHalfBodyImg(ref)
+    if ref == "f01" then return imgNpcF01 end
+    if ref == "f02" then return imgNpcF02 end
+    if ref == "f03" then return imgNpcF03 end
+    return -1
+end
+
+
+
+
 -- ── 内部状态 ────────────────────────────────────────────────────────────────
-local tab = 1              -- 当前标签页索引
-local tabs = {}            -- 当前岛屿的可用标签页列表 { { key, label, drawFn, keyFn }, ... }
-local cursor = 1           -- 卖鱼列表当前选中行
-local scrollOffset = 0     -- 列表滚动偏移
-local ROW_H = 28           -- 每行高度
-local MAX_VISIBLE = 8      -- 可见行数
-
--- ── 定价 ────────────────────────────────────────────────────────────────────
-local PRICE_PER_KG_PER_DIFF = 4   -- 每kg每难度等级的价格
-local FUEL_COST_PER_UNIT    = 1   -- 每单位燃油价格
-
--- ── 颜色常量（与 Inventory 同色系）────────────────────────────────────────
-local C_BG        = { 12, 22, 45, 220 }
-local C_BORDER    = { 80, 160, 240, 160 }
-local C_OVERLAY   = { 0, 0, 0, 140 }
-local C_TITLE     = { 200, 220, 255, 255 }
-local C_TAB_ON    = { 100, 200, 255, 255 }
-local C_TAB_OFF   = { 120, 130, 150, 180 }
-local C_TAB_BG_ON = { 40, 80, 140, 160 }
-local C_LABEL     = { 180, 195, 220, 220 }
-local C_VALUE     = { 230, 240, 255, 255 }
-local C_DIM       = { 130, 140, 160, 180 }
-local C_GOLD      = { 255, 220, 80, 240 }
-local C_HEADER    = { 140, 160, 190, 200 }
-local C_SUM_LINE  = { 80, 100, 140, 120 }
-local C_SUM_TEXT  = { 200, 220, 255, 240 }
-local C_STARS     = { 255, 200, 50, 255 }
-local C_SCROLL    = { 80, 120, 180, 120 }
-local C_SEL_BG    = { 40, 120, 80, 100 }     -- 选中行高亮
-local C_PRICE     = { 255, 220, 80, 240 }     -- 价格金色
-local C_AFFORD    = { 100, 255, 150, 240 }    -- 买得起
-local C_NO_AFFORD = { 255, 100, 100, 200 }    -- 买不起
-local C_FUEL_OK   = { 80, 220, 160, 220 }     -- 油量充足
-local C_EMPTY_MSG = { 140, 155, 180, 180 }    -- 空列表提示
+local menuItems_ = {}       -- level 1 选项列表
+local _hitboxes  = {}       -- 当前帧可点击区域
+local openTime_  = 0        -- Level 1 弹入动画起始时间
+local inquiryMode_ = false  -- 是否在"打探消息"子对话中
+local inquiryText_ = "去东南方向找巴兰 他能升级你的船 \n西北边住着老于勒 他做些贝壳生意."
+local inquiryItems_ = {
+    { id = "inquiry_fish", label = "打探鱼类信息" },
+    { id = "inquiry_back", label = "返回" },
+}
 
 -- ── 辅助 ────────────────────────────────────────────────────────────────────
-local function rgba(c)
-    return nvgRGBA(c[1], c[2], c[3], c[4])
+local function rgba(r,g,b,a) return nvgRGBA(r,g,b,a or 255) end
+
+local function addHit(id, x, y, w, h)
+    _hitboxes[#_hitboxes + 1] = { id=id, x=x, y=y, w=w, h=h }
 end
 
---- 计算单条鱼的售价
-function IslandMenu.CalcFishPrice(fish)
-    local basePerKg = fish.type.diff * PRICE_PER_KG_PER_DIFF
-    local price = math.floor(fish.weight * basePerKg + 0.5)
-    return math.max(1, price)
+local function hitTest(mx, my)
+    for _, box in ipairs(_hitboxes) do
+        if mx >= box.x and mx <= box.x + box.w and
+           my >= box.y and my <= box.y + box.h then
+            return box.id
+        end
+    end
+    return nil
 end
 
---- 计算加油费用
-local function calcRefuelCost(amount)
-    return math.ceil(amount * FUEL_COST_PER_UNIT)
+-- ── 加粗白字（黑色四方向描边）────────────────────────────────────────────────
+local function BoldText(vg, x, y, text, size, align, r, g, b, a)
+    r, g, b, a = r or 255, g or 255, b or 255, a or 255
+    nvgFontFace(vg, "sans-bold")
+    nvgFontSize(vg, size)
+    nvgTextAlign(vg, align)
+    nvgFillColor(vg, rgba(0, 0, 0, 190))
+    nvgText(vg, x-1, y,   text, nil)
+    nvgText(vg, x+1, y,   text, nil)
+    nvgText(vg, x,   y-1, text, nil)
+    nvgText(vg, x,   y+1, text, nil)
+    nvgFillColor(vg, rgba(r, g, b, a))
+    nvgText(vg, x, y, text, nil)
 end
 
--- ── 重置（传入岛屿对象，构建可用标签页）────────────────────────────────────
+
+
+
+
+
+
+-- ── Reset ─────────────────────────────────────────────────────────────────────
 function IslandMenu.Reset(island)
-    tab = 1
-    cursor = 1
-    scrollOffset = 0
+    _hitboxes  = {}
+    openTime_  = time:GetElapsedTime()   -- 记录弹入动画起点
+    inquiryMode_ = false                 -- 重置打探消息子对话状态
 
-    -- 根据 island.features 构建当前可用标签页
-    tabs = {}
-    if island and island.features then
-        for _, fkey in ipairs(island.features) do
-            local meta = FEATURE_META[fkey]
-            if meta then
-                tabs[#tabs + 1] = {
-                    key    = fkey,
-                    label  = meta.label,
-                    drawFn = meta.drawFn,
-                    keyFn  = meta.keyFn,
-                }
-            end
-        end
-    end
-    -- 保底：如果 features 为空，给一个空 tabs（不会崩溃，只是没功能）
+    menuItems_ = {}
+    -- 鱼铺：始终可用
+    menuItems_[#menuItems_ + 1] = { id = "quest",     label = "鱼铺" }
+    -- 商店：始终可用
+    menuItems_[#menuItems_ + 1] = { id = "rod_shop",  label = "商店" }
+    -- 仓库：所有岛屿可用
+    menuItems_[#menuItems_ + 1] = { id = "warehouse", label = "仓库" }
+    -- 升级船只：所有岛屿可用
+    menuItems_[#menuItems_ + 1] = { id = "boat_upgrade", label = "升级船只" }
+    -- 打探消息：始终可用
+    menuItems_[#menuItems_ + 1] = { id = "inquiry",   label = "打探消息" }
 end
 
--- ── 按键处理 ────────────────────────────────────────────────────────────────
---- @param key number        按键码
---- @param ctx table         { island, caughtList, PlayerData }
---- @return boolean consumed 是否消耗
---- @return table|nil result 操作结果
+-- ── 鼠标点击处理 ─────────────────────────────────────────────────────────────
+--- @return table|nil result  { openQuest=true } / { close=true } / nil
+function IslandMenu.HandleMouseClick(mx, my, ctx)
+    local id = hitTest(mx, my)
+    if not id then return nil end
+
+    -- 打探消息子对话模式
+    if inquiryMode_ then
+        if id == "inquiry_back" then
+            inquiryMode_ = false
+            openTime_ = time:GetElapsedTime()  -- 重新触发弹入动画
+            return nil  -- 返回主菜单，不关闭整个对话
+        elseif id == "inquiry_fish" then
+            return { openInquiryFish = true }
+        elseif id == "close" then
+            return { close = true }
+        end
+        return nil
+    end
+
+    -- 主菜单模式
+    if id == "quest" then
+        return { openQuest = true }
+    elseif id == "rod_shop" then
+        return { openRodShop = true }
+    elseif id == "warehouse" then
+        return { openWarehouse = true }
+    elseif id == "boat_upgrade" then
+        return { openBoatUpgrade = true }
+    elseif id == "inquiry" then
+        inquiryMode_ = true
+        openTime_ = time:GetElapsedTime()  -- 重新触发弹入动画
+        return nil  -- 留在对话中，切换内容
+    elseif id == "close" then
+        return { close = true }
+    end
+    return nil
+end
+
+-- ── 按键处理 ─────────────────────────────────────────────────────────────────
 function IslandMenu.HandleKey(key, ctx)
-    local tabCount = #tabs
-    if tabCount == 0 then return true, nil end
-
-    -- 标签切换
-    if key == KEY_LEFT or key == KEY_RIGHT then
-        if key == KEY_LEFT then
-            tab = tab > 1 and (tab - 1) or tabCount
-        else
-            tab = tab < tabCount and (tab + 1) or 1
+    if key == KEY_ESCAPE then
+        if inquiryMode_ then
+            -- 从打探消息子对话返回主菜单
+            inquiryMode_ = false
+            openTime_ = time:GetElapsedTime()
+            return true, nil
         end
-        scrollOffset = 0
-        cursor = 1
-        return true, nil
+        return true, { close = true }
     end
-
-    -- 分发到当前标签页的按键处理函数
-    local currentTab = tabs[tab]
-    if currentTab and IslandMenu[currentTab.keyFn] then
-        return IslandMenu[currentTab.keyFn](key, ctx)
-    end
+    if key == KEY_Q      then return true, { openQuest = true } end
     return true, nil
 end
 
--- ── 卖鱼按键 ────────────────────────────────────────────────────────────────
-function IslandMenu._HandleSellKey(key, ctx)
-    local list = ctx.caughtList
-    local count = #list
 
-    if key == KEY_UP then
-        if cursor > 1 then cursor = cursor - 1 end
-        -- 滚动跟随光标
-        if cursor <= scrollOffset then scrollOffset = cursor - 1 end
-        return true, nil
-    end
 
-    if key == KEY_DOWN then
-        if cursor < count then cursor = cursor + 1 end
-        if cursor > scrollOffset + MAX_VISIBLE then
-            scrollOffset = cursor - MAX_VISIBLE
-        end
-        return true, nil
-    end
 
-    -- Enter: 卖出选中鱼
-    if key == KEY_RETURN or key == KEY_KP_ENTER then
-        if count == 0 then return true, nil end
-        if cursor < 1 or cursor > count then return true, nil end
 
-        local fish = list[cursor]
-        local price = IslandMenu.CalcFishPrice(fish)
-        local soldWeight = fish.weight
-        local fishName = fish.type.name
+-- ============================================================================
+-- 绘制
+-- ============================================================================
 
-        ctx.PlayerData.AddMoney(price)
-        table.remove(list, cursor)
-
-        -- 修正光标
-        local newCount = #list
-        if cursor > newCount and newCount > 0 then cursor = newCount end
-        if cursor < 1 then cursor = 1 end
-        local maxScroll = math.max(0, newCount - MAX_VISIBLE)
-        if scrollOffset > maxScroll then scrollOffset = maxScroll end
-
-        return true, { soldWeight = soldWeight, soldCount = 1, income = price, fishName = fishName }
-    end
-
-    -- A: 全部卖出
-    if key == KEY_A then
-        if count == 0 then return true, nil end
-
-        local totalIncome = 0
-        local totalSoldWeight = 0
-        for _, fish in ipairs(list) do
-            local price = IslandMenu.CalcFishPrice(fish)
-            totalIncome = totalIncome + price
-            totalSoldWeight = totalSoldWeight + fish.weight
-        end
-        local soldCount = count
-
-        ctx.PlayerData.AddMoney(totalIncome)
-
-        -- 清空列表（反向移除保持引用）
-        for i = count, 1, -1 do
-            table.remove(list, i)
-        end
-
-        cursor = 1
-        scrollOffset = 0
-
-        return true, { soldWeight = totalSoldWeight, soldCount = soldCount, income = totalIncome, fishName = "" }
-    end
-
-    return true, nil
+function IslandMenu.Draw(vg, sw, sh, ctx, mx, my)
+    _hitboxes = {}
+    mx = mx or 0
+    my = my or 0
+    IslandMenu._DrawLobby(vg, sw, sh, ctx, mx, my)
 end
 
--- ── 补给按键 ────────────────────────────────────────────────────────────────
-function IslandMenu._HandleSupplyKey(key, ctx)
-    local PD = ctx.PlayerData
-    local currentFuel = PD.GetFuel()
-    local maxFuel = PD.GetFuelMax()
-
-    local function tryRefuel(amount)
-        local need = math.min(amount, maxFuel - currentFuel)
-        if need <= 0 then return true, nil end
-        local cost = calcRefuelCost(need)
-        if not PD.CanAfford(cost) then return true, nil end
-        PD.SpendMoney(cost)
-        PD.AddFuel(need)
-        return true, { fuelAdded = need, cost = cost }
-    end
-
-    -- Enter: 加满
-    if key == KEY_RETURN or key == KEY_KP_ENTER then
-        return tryRefuel(maxFuel)
-    end
-
-    -- 1: +10
-    if key == KEY_1 then
-        return tryRefuel(10)
-    end
-
-    -- 2: +30
-    if key == KEY_2 then
-        return tryRefuel(30)
-    end
-
-    return true, nil
-end
-
--- ── 主绘制 ──────────────────────────────────────────────────────────────────
-function IslandMenu.Draw(vg, sw, sh, ctx)
-    local pw = math.min(460, sw - 40)
-    local ph = math.min(420, sh - 40)
-    local px = math.floor((sw - pw) / 2)
-    local py = math.floor((sh - ph) / 2)
-
-    -- 遮罩
-    nvgBeginPath(vg)
-    nvgRect(vg, 0, 0, sw, sh)
-    nvgFillColor(vg, rgba(C_OVERLAY))
-    nvgFill(vg)
-
-    -- 面板背景
-    nvgBeginPath(vg)
-    nvgRoundedRect(vg, px, py, pw, ph, 10)
-    nvgFillColor(vg, rgba(C_BG))
-    nvgFill(vg)
-    nvgStrokeColor(vg, rgba(C_BORDER))
-    nvgStrokeWidth(vg, 1.5)
-    nvgStroke(vg)
-
-    -- 标题栏（显示岛屿名称）
-    local titleH = 38
+-- ── Level 1: 对话框 + 右侧选项（新 UI 图片版，1080p 基准缩放）────────────────
+function IslandMenu._DrawLobby(vg, sw, sh, ctx, mx, my)
     local island = ctx.island
-    local titleText = island and island.name or "岛屿"
-    nvgFontFace(vg, "sans")
-    nvgFontSize(vg, 18)
-    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
-    nvgFillColor(vg, rgba(C_TITLE))
-    nvgText(vg, px + 16, py + titleH * 0.5, titleText, nil)
 
-    nvgFontSize(vg, 12)
-    nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
-    nvgFillColor(vg, rgba(C_DIM))
-    nvgText(vg, px + pw - 12, py + titleH * 0.5, "[E] 关闭", nil)
+    -- ── UI 缩放：以 1080p 高度为基准 ────────────────────────────────────────
+    local S = sh / 1080   -- 所有 1080p 下的像素值 × S 得到实际像素
 
-    -- 分隔线
-    nvgBeginPath(vg)
-    nvgMoveTo(vg, px + 10, py + titleH)
-    nvgLineTo(vg, px + pw - 10, py + titleH)
-    nvgStrokeColor(vg, rgba(C_SUM_LINE))
-    nvgStrokeWidth(vg, 1)
-    nvgStroke(vg)
+    -- ── 弹入动画（Back Ease Out）────────────────────────────────────────────
+    local ANIM_DUR = 0.38
+    local elapsed  = time:GetElapsedTime() - openTime_
+    local t        = math.min(1.0, elapsed / ANIM_DUR)
+    local c1    = 1.70158
+    local c3    = c1 + 1
+    local tm1   = t - 1
+    local animScale = 1.0 + c3 * tm1 * tm1 * tm1 + c1 * tm1 * tm1
 
-    -- 标签栏（动态生成）
-    local tabY = py + titleH + 4
-    local tabH = 28
-    local tabW = 70
-    local tabCount = #tabs
-    for i, tabDef in ipairs(tabs) do
-        local tx = px + 12 + (i - 1) * (tabW + 8)
-        local isOn = (i == tab)
-        if isOn then
+    local pivotX = sw * 0.5
+    local pivotY = sh
+    nvgSave(vg)
+    nvgTranslate(vg, pivotX, pivotY)
+    nvgScale(vg, animScale, animScale)
+    nvgTranslate(vg, -pivotX, -pivotY)
+
+    -- ── 布局：底部对话框（1080p 原始尺寸 × S）──────────────────────────────
+    local DIAL_W   = BG_W * S
+    local DIAL_H   = BG_H * S
+    local DIAL_X   = math.floor((sw - DIAL_W) / 2)          -- 水平居中
+    local DIAL_Y   = math.floor(sh - DIAL_H - 20 * S)       -- 距屏幕底部 20px(1080p)
+
+    -- ── 岛屿 NPC 配置（仅特定岛屿生效）─────────────────────────────────────────
+    local islandId  = island and island.id
+    local npcConfig = islandId and ISLAND_NPC_CONFIG[islandId] or nil
+
+    -- ── NPC 半身绘（绘制在对话框背景之前，即对话框后方）──────────────────────
+    if npcConfig and npcConfig.halfBodyRef then
+        local hbImg = getNpcHalfBodyImg(npcConfig.halfBodyRef)
+        if hbImg and hbImg > 0 then
+            -- 半身绘高度 = 对话框高度的 2.0/1.2 倍，宽度按原始比例缩放
+            local HB_SCALE_H = 2.0 / 1.2
+            local hbH = DIAL_H * HB_SCALE_H
+            local hbW = hbH * (npcConfig.halfBodyW / npcConfig.halfBodyH)
+            -- 水平：与名字标签对齐，贴紧对话框左侧
+            local hbX = DIAL_X - hbW * 0.05 - 40 * S
+            -- 垂直：底部与对话框底部对齐，再上移 200px(1080p)
+            local hbY = DIAL_Y + DIAL_H - hbH - 200 * S
+            local hbPat = nvgImagePattern(vg, hbX, hbY, hbW, hbH, 0, hbImg, 1.0)
             nvgBeginPath(vg)
-            nvgRoundedRect(vg, tx, tabY, tabW, tabH, 6)
-            nvgFillColor(vg, rgba(C_TAB_BG_ON))
+            nvgRect(vg, hbX, hbY, hbW, hbH)
+            nvgFillPaint(vg, hbPat)
             nvgFill(vg)
         end
-        nvgFontSize(vg, 14)
-        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-        nvgFillColor(vg, rgba(isOn and C_TAB_ON or C_TAB_OFF))
-        nvgText(vg, tx + tabW / 2, tabY + tabH / 2, tabDef.label, nil)
     end
 
-    if tabCount > 1 then
-        nvgFontSize(vg, 11)
-        nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_MIDDLE)
-        nvgFillColor(vg, rgba(C_DIM))
-        nvgText(vg, px + pw - 12, tabY + tabH / 2, "← → 切换", nil)
-    end
-
-    -- 内容区（分发到当前标签页的绘制函数）
-    local contentY = tabY + tabH + 8
-    local contentH = py + ph - contentY - 10
-
-    local currentTab = tabs[tab]
-    if currentTab and IslandMenu[currentTab.drawFn] then
-        IslandMenu[currentTab.drawFn](vg, px, contentY, pw, contentH, ctx)
-    else
-        -- 无可用标签页时显示提示
-        nvgFontSize(vg, 14)
-        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-        nvgFillColor(vg, rgba(C_EMPTY_MSG))
-        nvgText(vg, px + pw / 2, contentY + contentH / 2, "此岛屿暂无可用服务", nil)
-    end
-end
-
--- ── 卖鱼标签 ────────────────────────────────────────────────────────────────
-function IslandMenu._DrawSellTab(vg, px, cy, pw, ch, ctx)
-    local list = ctx.caughtList
-    local count = #list
-    local y = cy + 4
-
-    -- 表头
-    nvgFontSize(vg, 12)
-    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
-    nvgFillColor(vg, rgba(C_HEADER))
-    nvgText(vg, px + 20, y, "#", nil)
-    nvgText(vg, px + 46, y, "鱼种", nil)
-    nvgText(vg, px + 150, y, "重量", nil)
-    nvgText(vg, px + 230, y, "单价", nil)
-    nvgText(vg, px + 310, y, "小计", nil)
-    y = y + 20
-
-    nvgBeginPath(vg)
-    nvgMoveTo(vg, px + 16, y)
-    nvgLineTo(vg, px + pw - 16, y)
-    nvgStrokeColor(vg, rgba(C_SUM_LINE))
-    nvgStrokeWidth(vg, 1)
-    nvgStroke(vg)
-    y = y + 4
-
-    -- 空列表
-    if count == 0 then
-        nvgFontSize(vg, 14)
-        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
-        nvgFillColor(vg, rgba(C_EMPTY_MSG))
-        nvgText(vg, px + pw / 2, y + 30, "暂无渔获，先去钓鱼吧！", nil)
-        return
-    end
-
-    -- 保证光标范围合法
-    if cursor > count then cursor = count end
-    if cursor < 1 then cursor = 1 end
-
-    -- 可见行计算
-    local listAreaH = ch - (y - cy) - 50
-    local visibleRows = math.max(1, math.floor(listAreaH / ROW_H))
-    local maxScroll = math.max(0, count - visibleRows)
-    if scrollOffset > maxScroll then scrollOffset = maxScroll end
-
-    local startIdx = scrollOffset + 1
-    local endIdx = math.min(count, scrollOffset + visibleRows)
-
-    -- 累计总价
-    local grandTotal = 0
-
-    for i = startIdx, endIdx do
-        local fish = list[i]
-        local ft = fish.type
-        local fy = y + (i - startIdx) * ROW_H
-        local price = IslandMenu.CalcFishPrice(fish)
-        local unitPrice = ft.diff * PRICE_PER_KG_PER_DIFF
-        grandTotal = grandTotal + price
-
-        -- 选中行高亮
-        if i == cursor then
-            nvgBeginPath(vg)
-            nvgRoundedRect(vg, px + 12, fy - 2, pw - 24, ROW_H - 2, 4)
-            nvgFillColor(vg, rgba(C_SEL_BG))
-            nvgFill(vg)
-        end
-
-        nvgFontSize(vg, 13)
-
-        -- 序号
-        nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_TOP)
-        nvgFillColor(vg, rgba(C_DIM))
-        nvgText(vg, px + 38, fy, tostring(i), nil)
-
-        -- 鱼名
-        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
-        local fc = ft.color or {180, 200, 220}
-        nvgFillColor(vg, nvgRGBA(fc[1], fc[2], fc[3], 240))
-        nvgText(vg, px + 46, fy, ft.name, nil)
-
-        -- 重量
-        nvgFillColor(vg, rgba(C_VALUE))
-        nvgText(vg, px + 150, fy, FormatWeight(fish.weight), nil)
-
-        -- 单价
-        nvgFillColor(vg, rgba(C_DIM))
-        nvgText(vg, px + 230, fy, string.format("%d/kg", unitPrice), nil)
-
-        -- 小计
-        nvgFillColor(vg, rgba(C_PRICE))
-        nvgText(vg, px + 310, fy, string.format("%d 💰", price), nil)
-    end
-
-    -- 计算所有鱼的总价（包括不可见的）
-    grandTotal = 0
-    for _, fish in ipairs(list) do
-        grandTotal = grandTotal + IslandMenu.CalcFishPrice(fish)
-    end
-
-    -- 滚动条
-    if count > visibleRows then
-        local barX = px + pw - 14
-        local barAreaY = y
-        local barAreaH = visibleRows * ROW_H
-        local thumbH = math.max(20, barAreaH * (visibleRows / count))
-        local scrollRatio = maxScroll > 0 and (scrollOffset / maxScroll) or 0
-        local thumbY = barAreaY + (barAreaH - thumbH) * scrollRatio
+    -- 对话框背景图
+    if imgDialogBg > 0 then
+        local bgPat = nvgImagePattern(vg, DIAL_X, DIAL_Y, DIAL_W, DIAL_H, 0, imgDialogBg, 1.0)
         nvgBeginPath(vg)
-        nvgRoundedRect(vg, barX, thumbY, 4, thumbH, 2)
-        nvgFillColor(vg, rgba(C_SCROLL))
+        nvgRect(vg, DIAL_X, DIAL_Y, DIAL_W, DIAL_H)
+        nvgFillPaint(vg, bgPat)
+        nvgFill(vg)
+    else
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, DIAL_X, DIAL_Y, DIAL_W, DIAL_H, 12)
+        nvgFillColor(vg, rgba(244, 239, 227, 240))
         nvgFill(vg)
     end
 
-    -- 底部合计 + 操作提示
-    local sumY = cy + ch - 44
-    nvgBeginPath(vg)
-    nvgMoveTo(vg, px + 16, sumY)
-    nvgLineTo(vg, px + pw - 16, sumY)
-    nvgStrokeColor(vg, rgba(C_SUM_LINE))
-    nvgStrokeWidth(vg, 1)
-    nvgStroke(vg)
+    -- ── NPC 名字标签（1080p 原始尺寸 × S，叠在对话框左上角）────────────────
+    local TAG_W_D = TAG_W * S
+    local TAG_H_D = TAG_H * S
+    local tagX    = DIAL_X + 40 * S
+    local tagY    = DIAL_Y - TAG_H_D * 0.5   -- 叠入对话框顶部一半
 
-    nvgFontSize(vg, 13)
-    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
-    nvgFillColor(vg, rgba(C_SUM_TEXT))
-    nvgText(vg, px + 20, sumY + 8,
-        string.format("合计: %d 条  总价: %d 💰", count, grandTotal), nil)
-
-    nvgFontSize(vg, 11)
-    nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_TOP)
-    nvgFillColor(vg, rgba(C_DIM))
-    nvgText(vg, px + pw - 16, sumY + 8, "[Enter] 卖出", nil)
-    nvgText(vg, px + pw - 16, sumY + 22, "[A] 全部卖出  ↑↓ 选择", nil)
-end
-
--- ── 补给标签 ────────────────────────────────────────────────────────────────
-function IslandMenu._DrawSupplyTab(vg, px, cy, pw, ch, ctx)
-    local PD = ctx.PlayerData
-    local fuel = PD.GetFuel()
-    local fuelMax = PD.GetFuelMax()
-    local money = PD.GetMoney()
-
-    local y = cy + 16
-
-    -- 燃油标题
-    nvgFontSize(vg, 15)
-    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
-    nvgFillColor(vg, nvgRGBA(255, 160, 60, 240))
-    nvgText(vg, px + 20, y, "⛽  燃油补给", nil)
-    y = y + 30
-
-    -- 燃油进度条
-    local barX = px + 24
-    local barW = pw - 48
-    local barH = 18
-
-    -- 背景
-    nvgBeginPath(vg)
-    nvgRoundedRect(vg, barX, y, barW, barH, 6)
-    nvgFillColor(vg, nvgRGBA(20, 20, 30, 200))
-    nvgFill(vg)
-
-    -- 填充
-    local pct = math.max(0, math.min(1, fuel / fuelMax))
-    local fillW = barW * pct
-    local r, g, b
-    if pct > 0.5 then
-        local t = (pct - 0.5) / 0.5
-        r = math.floor(255 * (1 - t))
-        g = 220
-        b = math.floor(60 * (1 - t))
-    else
-        local t = pct / 0.5
-        r = 255
-        g = math.floor(220 * t)
-        b = 0
-    end
-    if fillW > 0 then
+    if imgNameTag > 0 then
+        local tagPat = nvgImagePattern(vg, tagX, tagY, TAG_W_D, TAG_H_D, 0, imgNameTag, 1.0)
         nvgBeginPath(vg)
-        nvgRoundedRect(vg, barX, y, fillW, barH, 6)
-        nvgFillColor(vg, nvgRGBA(r, g, b, 220))
+        nvgRect(vg, tagX, tagY, TAG_W_D, TAG_H_D)
+        nvgFillPaint(vg, tagPat)
+        nvgFill(vg)
+    else
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, tagX, tagY, TAG_W_D, TAG_H_D, 8)
+        nvgFillColor(vg, rgba(254, 198, 95, 240))
         nvgFill(vg)
     end
-
-    -- 数值
-    nvgFontSize(vg, 12)
+    -- 名字：NPC配置优先，回退到岛屿名
+    local npcName = (npcConfig and npcConfig.name) or (island and island.name) or "岛屿"
+    nvgFontFace(vg, "sans-bold")
+    nvgFontSize(vg, 42 * S)
     nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-    nvgFillColor(vg, nvgRGBA(255, 255, 255, 220))
-    nvgText(vg, barX + barW / 2, y + barH / 2,
-        string.format("%d / %d", math.ceil(fuel), fuelMax), nil)
-    y = y + barH + 20
+    nvgFillColor(vg, rgba(80, 45, 10, 230))
+    nvgText(vg, tagX + TAG_W_D / 2, tagY + TAG_H_D / 2, npcName, nil)
 
-    -- 加满费用
-    local need = math.max(0, fuelMax - fuel)
-    local fullCost = calcRefuelCost(need)
+    -- ── 对话文字：50pt 加粗，上下居中，左对齐 ────────────────────────────────
+    -- 文字区：对话框左半部分，水平留边
+    local TEXT_PAD_L = 60 * S    -- 左侧内边距
+    local TEXT_PAD_R = 20 * S    -- 文字区右侧与选项区的间隔
+    local TEXT_AREA_W = DIAL_W * 0.48   -- 左半留给文字
+    local textX = DIAL_X + TEXT_PAD_L
+    local textW = TEXT_AREA_W - TEXT_PAD_L - TEXT_PAD_R
+    -- 打探消息模式使用专属文本，否则使用 NPC 对话
+    local dialogMsg = inquiryMode_ and inquiryText_
+        or ((npcConfig and npcConfig.dialog) or "要做些什么呢？")
+    local fontSize50 = 50 * S
+    local lineH = fontSize50 * 1.3
 
-    nvgFontSize(vg, 14)
-    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
+    -- 拆分换行，计算总文字块高度后垂直居中
+    local lines = {}
+    for line in (dialogMsg .. "\n"):gmatch("([^\n]*)\n") do
+        lines[#lines + 1] = line
+    end
+    local totalTextH = #lines * lineH
+    local textBlockY = DIAL_Y + (DIAL_H - totalTextH) / 2
 
-    if need <= 0 then
-        nvgFillColor(vg, rgba(C_FUEL_OK))
-        nvgText(vg, px + 24, y, "油箱已满！", nil)
-        y = y + 28
-    else
-        nvgFillColor(vg, rgba(C_LABEL))
-        nvgText(vg, px + 24, y,
-            string.format("加满需要: %d 单位 = %d 💰", math.ceil(need), fullCost), nil)
-        y = y + 28
+    nvgFontFace(vg, "sans-bold")
+    nvgFontSize(vg, fontSize50)
+    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
+    nvgFillColor(vg, rgba(60, 35, 10, 230))
+    for i, line in ipairs(lines) do
+        nvgText(vg, textX, textBlockY + (i - 0.5) * lineH, line, nil)
     end
 
-    -- 当前金钱
-    nvgFillColor(vg, rgba(C_LABEL))
-    nvgText(vg, px + 24, y, "当前金钱: ", nil)
-    local canAffordFull = money >= fullCost
-    nvgFillColor(vg, rgba(canAffordFull and C_AFFORD or C_GOLD))
-    nvgText(vg, px + 110, y, string.format("%d 💰", money), nil)
-    y = y + 36
+    -- Esc 提示（对话框右下角）
+    nvgFontFace(vg, "sans")
+    nvgFontSize(vg, 18 * S)
+    nvgTextAlign(vg, NVG_ALIGN_RIGHT + NVG_ALIGN_BOTTOM)
+    nvgFillColor(vg, rgba(120, 90, 40, 160))
+    nvgText(vg, DIAL_X + DIAL_W - 78 * S, DIAL_Y + DIAL_H - 19 * S, "[Esc] 离开", nil)
 
-    -- 操作区分隔线
-    nvgBeginPath(vg)
-    nvgMoveTo(vg, px + 20, y)
-    nvgLineTo(vg, px + pw - 20, y)
-    nvgStrokeColor(vg, rgba(C_SUM_LINE))
-    nvgStrokeWidth(vg, 1)
-    nvgStroke(vg)
-    y = y + 14
+    -- ── 选项按钮（1080p 原始尺寸 × S，底部锚点对齐）──────────────────────────
+    local OPT_W        = BTN_W * S
+    local OPT_H        = BTN_H * S
+    local OPT_GAP      = 20 * S          -- 1080p 下按钮间距 20px
+    local OPT_MARGIN_R = 60 * S          -- 距对话框右边缘（1080p）
+    -- 打探消息模式使用专属选项列表
+    local currentItems = inquiryMode_ and inquiryItems_ or menuItems_
+    local n            = #currentItems
+    local optsH        = n * OPT_H + (n - 1) * OPT_GAP
+    -- 锚点：以对话框垂直中心为基准，上移 220px、右移 300px（1080p 坐标）
+    -- 最下方按钮的底部固定在此锚点，按钮组向上堆叠
+    local ANCHOR_BOTTOM_Y = DIAL_Y + DIAL_H / 2
+    local OPT_X           = DIAL_X + DIAL_W - OPT_W - OPT_MARGIN_R + 300 * S
+    local OPT_TOP         = ANCHOR_BOTTOM_Y - optsH
 
-    -- 操作按钮提示
-    nvgFontSize(vg, 13)
-    nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
+    for i, item in ipairs(currentItems) do
+        local bx  = OPT_X
+        local by  = OPT_TOP + (i - 1) * (OPT_H + OPT_GAP)
+        local hov = mx >= bx and mx <= bx + OPT_W and my >= by and my <= by + OPT_H
 
-    if need > 0 then
-        -- 加满
-        local canFull = PD.CanAfford(fullCost)
-        nvgFillColor(vg, rgba(canFull and C_AFFORD or C_NO_AFFORD))
-        nvgText(vg, px + 24, y,
-            string.format("[Enter]  加满  (%d 💰)", fullCost), nil)
-        y = y + 24
+        -- hover 时微放大
+        local drawX, drawY, drawW, drawH = bx, by, OPT_W, OPT_H
+        if hov then
+            local ex = 6 * S
+            local ey = ex * BTN_H / BTN_W
+            drawX, drawY = bx - ex, by - ey
+            drawW, drawH = OPT_W + ex * 2, OPT_H + ey * 2
+        end
 
-        -- +10
-        local need10 = math.min(10, need)
-        local cost10 = calcRefuelCost(need10)
-        local can10 = PD.CanAfford(cost10)
-        nvgFillColor(vg, rgba(can10 and C_AFFORD or C_NO_AFFORD))
-        nvgText(vg, px + 24, y,
-            string.format("[1]  +%d 燃油  (%d 💰)", math.ceil(need10), cost10), nil)
-        y = y + 24
+        if imgButton > 0 then
+            local btnPat = nvgImagePattern(vg, drawX, drawY, drawW, drawH, 0, imgButton, hov and 1.0 or 0.9)
+            nvgBeginPath(vg)
+            nvgRect(vg, drawX, drawY, drawW, drawH)
+            nvgFillPaint(vg, btnPat)
+            nvgFill(vg)
+        else
+            nvgBeginPath(vg)
+            nvgRoundedRect(vg, bx, by, OPT_W, OPT_H, 8)
+            nvgFillColor(vg, rgba(33, 33, 33, hov and 255 or 210))
+            nvgFill(vg)
+        end
 
-        -- +30
-        local need30 = math.min(30, need)
-        local cost30 = calcRefuelCost(need30)
-        local can30 = PD.CanAfford(cost30)
-        nvgFillColor(vg, rgba(can30 and C_AFFORD or C_NO_AFFORD))
-        nvgText(vg, px + 24, y,
-            string.format("[2]  +%d 燃油  (%d 💰)", math.ceil(need30), cost30), nil)
-        y = y + 30
+        -- 按钮文字：42pt 加粗，居中
+        nvgFontFace(vg, "sans-bold")
+        nvgFontSize(vg, 42 * S)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, hov and rgba(255, 230, 120, 255) or rgba(230, 220, 200, 255))
+        nvgText(vg, bx + OPT_W / 2, by + OPT_H / 2, item.label, nil)
+
+        addHit(item.id, bx, by, OPT_W, OPT_H)
     end
 
-    -- 底部提示
-    nvgFontSize(vg, 11)
-    nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
-    nvgFillColor(vg, rgba(C_DIM))
-    nvgText(vg, px + pw / 2, cy + ch - 20, "燃油不足时船只无法加速", nil)
+    -- 关闭热区（对话框左侧空白）
+    addHit("close", 0, 0, DIAL_X - 1, sh)
+
+    nvgRestore(vg)
 end
 
 return IslandMenu

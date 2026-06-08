@@ -133,6 +133,8 @@ end
 function IslandSystem.DrawBelow(nvg, WorldToScreen, screenW, screenH, gameTime)
     for _, island in pairs(islands) do
         local sx, sy = WorldToScreen(island.x, island.y)
+        -- Pixel snapping：对齐到整数像素，消除像素风贴图移动时的亚像素抖动
+        sx, sy = math.floor(sx + 0.5), math.floor(sy + 0.5)
         local w, h = island.w, island.h
         local dw, dh = w * TEXTURE_SCALE, h * TEXTURE_SCALE  -- 显示尺寸
         local margin = math.max(dw, dh) * 0.8
@@ -233,6 +235,7 @@ end
 function IslandSystem.DrawAbove(nvg, WorldToScreen, screenW, screenH, gameTime)
     for _, island in pairs(islands) do
         local sx, sy = WorldToScreen(island.x, island.y)
+        sx, sy = math.floor(sx + 0.5), math.floor(sy + 0.5)
         local dw, dh = island.w * TEXTURE_SCALE, island.h * TEXTURE_SCALE
         local margin = math.max(dw, dh) * 0.8
 
